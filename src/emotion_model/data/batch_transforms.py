@@ -164,6 +164,7 @@ def apply_modality_keep_masks(
             physiology_available,
         ),
         speech_activity_ratios=batch.speech_activity_ratios,
+        speech_activity_observed=batch.speech_activity_observed,
     )
 
 
@@ -311,6 +312,11 @@ def select_aligned_multimodal_batch(
             None
             if batch.speech_activity_ratios is None
             else _select_rows(batch.speech_activity_ratios, old_indices)
+        ),
+        speech_activity_observed=(
+            None
+            if batch.speech_activity_observed is None
+            else _select_rows(batch.speech_activity_observed, old_indices)
         ),
     )
 

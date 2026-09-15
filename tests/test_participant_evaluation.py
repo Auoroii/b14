@@ -423,7 +423,7 @@ def test_runner_calibrates_only_on_validation_participants() -> None:
         ),
         calibrate_thresholds=True,
     )
-    assert "validation_equal_participant_macro_f1" in (
+    assert "validation_pooled_macro_f1" in (
         calibrated.binary_decision_thresholds.policy
     )
     with pytest.raises(ValueError, match="only on validation"):

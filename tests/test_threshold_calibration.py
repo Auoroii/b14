@@ -11,8 +11,8 @@ from emotion_model.evaluation import (
 )
 
 
-def test_calibration_finds_independent_equal_participant_thresholds() -> None:
-    """Find task thresholds that separate both validation participants."""
+def test_calibration_finds_independent_pooled_macro_f1_thresholds() -> None:
+    """Find task thresholds that separate both validation classes."""
 
     participant_ids = ("P1", "P1", "P2", "P2")
     targets = torch.tensor([0, 1, 0, 1], dtype=torch.long)
@@ -34,7 +34,7 @@ def test_calibration_finds_independent_equal_participant_thresholds() -> None:
 
     assert 0.64 <= thresholds.arousal_high < 0.80
     assert 0.39 <= thresholds.valence_high < 0.45
-    assert "validation_equal_participant_macro_f1" in thresholds.policy
+    assert "validation_pooled_macro_f1" in thresholds.policy
 
 
 def test_threshold_metadata_round_trip_is_exact_and_strict() -> None:

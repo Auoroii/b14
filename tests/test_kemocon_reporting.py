@@ -14,6 +14,7 @@ import torch
 
 from emotion_model.common import LabelProtocol
 from emotion_model.data import (
+    AlignedMultimodalSample,
     EmotionScores,
     MultimodalManifest,
     MultimodalWindowRecord,
@@ -25,15 +26,57 @@ from emotion_model.data import (
     kemocon_channel_specs,
     partition_manifest_by_participant,
 )
-from emotion_model.evaluation import compute_classification_metrics
+from emotion_model.evaluation import (
+    compute_classification_metrics,
+    compute_emotion_task_metrics,
+)
 from emotion_model.experiments import (
     append_jsonl_artifact,
+    build_cross_fold_evaluation_summary,
     build_environment_summary,
+    build_runtime_availability_audit,
     build_split_summary,
     classification_metrics_summary,
+    emotion_metrics_summary,
     write_effective_config_snapshot,
     write_json_artifact,
 )
+
+
+def _runtime_sample(
+    record: MultimodalWindowRecord,
+    *,
+    physiology_available: bool,
+) -> AlignedMultimodalSample:
+    """Build one fully validated synthetic sample for availability audits."""
+
+    channel_names = ("bvp", "eda", "temperature")
+    valid = torch.zeros((2, 3), dtype=torch.bool)
+    if physiology_available:
+        valid[:, 0] = True
+    quality = torch.zeros((3, 6), dtype=torch.float32)
+    return AlignedMultimodalSample(
+        record=record,
+        raw_arousal=record.emotion_scores.arousal,
+        raw_valence=record.emotion_scores.valence,
+        arousal_label=0,
+        valence_label=1,
+        quadrant_label=2,
+        label_ignore_index=-100,
+        speech_waveform=torch.ones(4),
+        speech_attention_mask=torch.ones(4, dtype=torch.bool),
+        speech_sample_rate_hz=16_000,
+        speech_available=True,
+        physio_input=valid.to(dtype=torch.float32),
+        physio_valid_mask=valid,
+        physio_time_mask=valid.any(dim=1),
+        physio_channel_mask=valid.any(dim=0),
+        physio_timestamps_seconds=torch.tensor([0.0, 1.0], dtype=torch.float64),
+        physio_channel_quality=quality,
+        physio_quality_features=quality.reshape(-1),
+        physiology_available=physiology_available,
+        channel_names=channel_names,
+    )
 
 
 @pytest.fixture
@@ -234,8 +277,102 @@ def test_split_summary_uses_the_named_strict_label_protocol() -> None:
     assert train["label_distribution"]["quadrant"]["ignored"] == 1
 
 
+def test_runtime_availability_audit_exposes_physio_losses_by_participant() -> None:
+    """Distinguish declared physiology from signal-valid runtime availability."""
+
+    partitioned = _partitioned_manifest()
+    samples = (
+        _runtime_sample(partitioned.train_records[0], physiology_available=True),
+        _runtime_sample(
+            partitioned.validation_records[0],
+            physiology_available=False,
+        ),
+        _runtime_sample(partitioned.test_records[0], physiology_available=False),
+    )
+
+    audit = build_runtime_availability_audit(samples)
+
+    assert audit["record_count"] == 3
+    assert audit["mismatch_count"] == 1
+    assert audit["mismatch_sample_ids"] == ["P3-sample"]
+    assert audit["modality_counts"]["physiology"] == {
+        "declared_count": 2,
+        "runtime_available_count": 1,
+        "declared_but_runtime_unavailable_count": 1,
+        "runtime_available_without_declaration_count": 0,
+    }
+    assert audit["declared_to_runtime_pattern_counts"]["both"]["speech_only"] == 1
+    assert audit["participant_counts"]["P3"]["physiology_mismatch_count"] == 1
+    assert audit["mismatch_label_distribution"]["arousal"]["low"] == 1
+    assert audit["runtime_modality_label_distributions"]["speech_only"][
+        "record_count"
+    ] == 2
+    assert audit["physiology_channel_counts"]["bvp"] == {
+        "declared_count": 2,
+        "runtime_available_count": 1,
+    }
+    json.dumps(audit, allow_nan=False)
+
+
+def _fold_evaluation(
+    fold_index: int,
+    participant_id: str,
+    offset: float,
+) -> dict[str, object]:
+    """Create the metric subset required by cross-fold aggregation."""
+
+    task = {
+        "accuracy": 0.7 + offset,
+        "macro_f1": 0.5 + offset,
+        "balanced_accuracy": 0.6 + offset,
+        "per_class": {
+            "low": {
+                "recall": 0.4 + offset,
+                "f1": 0.3 + offset,
+                "support": 3,
+            },
+            "high": {
+                "recall": 0.8 + offset,
+                "f1": 0.7 + offset,
+                "support": 7,
+            },
+        },
+    }
+    return {
+        "fold_index": fold_index,
+        "record_count": 10,
+        "participant_ids": [participant_id],
+        "overall": {"arousal": task, "valence": task},
+    }
+
+
+def test_cross_fold_summary_reports_mean_std_and_unique_test_people() -> None:
+    """Aggregate repeated folds without silently double-counting participants."""
+
+    summary = build_cross_fold_evaluation_summary(
+        (_fold_evaluation(0, "P1", 0.0), _fold_evaluation(1, "P2", 0.2))
+    )
+
+    assert summary["fold_count"] == 2
+    assert summary["test_participant_ids"] == ["P1", "P2"]
+    metric = summary["metrics"]["overall.valence.per_class.low.recall"]
+    assert metric["mean"] == pytest.approx(0.5)
+    assert metric["std"] == pytest.approx(0.1)
+    assert metric["fold_values"] == pytest.approx([0.4, 0.6])
+    json.dumps(summary, allow_nan=False)
+
+
+def test_cross_fold_summary_rejects_repeated_test_participant() -> None:
+    """Fail aggregation when dyad folds do not provide disjoint test people."""
+
+    with pytest.raises(ValueError, match="multiple folds"):
+        build_cross_fold_evaluation_summary(
+            (_fold_evaluation(0, "P1", 0.0), _fold_evaluation(1, "P1", 0.1))
+        )
+
+
 def test_classification_summary_preserves_confusion_matrix() -> None:
-    """Serialize scalar metrics and CPU confusion matrix ``[2,2]``."""
+    """Serialize existing fields and named binary per-class metrics."""
 
     metrics = compute_classification_metrics(
         torch.tensor([0, 0, 1, 1], dtype=torch.long),
@@ -248,6 +385,42 @@ def test_classification_summary_preserves_confusion_matrix() -> None:
     assert summary["accuracy"] == 0.75
     assert summary["confusion_matrix"] == [[1, 1], [0, 2]]
     assert summary["class_support"] == [2, 2]
+    assert summary["per_class"] == {
+        "low": {
+            "precision": 1.0,
+            "recall": 0.5,
+            "f1": pytest.approx(2 / 3),
+            "support": 2,
+        },
+        "high": {
+            "precision": pytest.approx(2 / 3),
+            "recall": 1.0,
+            "f1": 0.8,
+            "support": 2,
+        },
+    }
+    json.dumps(summary, allow_nan=False)
+
+
+def test_emotion_summary_exposes_binary_low_high_recall_paths() -> None:
+    """Expose the four required arousal/valence JSON recall paths."""
+    metrics = compute_emotion_task_metrics(
+        arousal_targets=torch.tensor([0, 0, 1, 1]),
+        arousal_predictions=torch.tensor([0, 1, 1, 1]),
+        valence_targets=torch.tensor([0, 1, 1, 0]),
+        valence_predictions=torch.tensor([0, 0, 1, 0]),
+        quadrant_targets=torch.tensor([0, 2, 3, 1]),
+        quadrant_predictions=torch.tensor([0, 2, 1, 1]),
+        ignore_index=-100,
+    )
+
+    overall = emotion_metrics_summary(metrics)
+
+    assert overall["arousal"]["per_class"]["low"]["recall"] == 0.5
+    assert overall["arousal"]["per_class"]["high"]["recall"] == 1.0
+    assert overall["valence"]["per_class"]["low"]["recall"] == 1.0
+    assert overall["valence"]["per_class"]["high"]["recall"] == 0.5
+    json.dumps({"overall": overall}, allow_nan=False)
 
 
 def test_training_entrypoint_uses_best_only_and_records_all_artifacts() -> None:
@@ -270,6 +443,7 @@ def test_training_entrypoint_uses_best_only_and_records_all_artifacts() -> None:
         "training_summary.json",
         "test_metrics.json",
         "test_ablation_metrics.json",
+        "cross_fold_summary.json",
     ):
         assert artifact in source
     assert "mean_macro_f1" in source
@@ -284,6 +458,8 @@ def test_training_entrypoint_uses_best_only_and_records_all_artifacts() -> None:
     assert "binary_decision_thresholds" in source
     assert "full_window_speech_statistics" in source
     assert "speech_statistics=training_speech_statistics" in source
+    assert "--all-folds" in source
+    assert "runtime_modality_availability_audit" in source
 
     evaluation_source = Path("scripts/evaluate_kemocon.py").read_text(
         encoding="utf-8"
@@ -305,3 +481,10 @@ def test_all_kemocon_entrypoints_prefer_their_local_source_tree() -> None:
         bootstrap = source.index("sys.path.insert(0, str(_LOCAL_SOURCE))")
         first_project_import = source.index("from emotion_model.")
         assert bootstrap < first_project_import
+
+
+def test_validation_entrypoint_imports_torch_for_source_statistics() -> None:
+    """Prevent the validation source-presence summary from raising NameError."""
+    source = Path("scripts/validate_kemocon.py").read_text(encoding="utf-8")
+    assert "import torch" in source
+    assert source.index("import torch") < source.index("torch.tensor(")

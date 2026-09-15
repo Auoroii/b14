@@ -255,7 +255,7 @@ def test_overfit_configuration_is_isolated_and_disables_regularization() -> None
     assert not diagnostic.training.lr_scheduler_enabled
     assert diagnostic.training.speech_modality_dropout == 0.0
     assert diagnostic.training.physiology_modality_dropout == 0.0
-    assert not diagnostic.training.participant_balanced_sampling
+    assert diagnostic.training.sampling_policy == "uniform"
     assert not diagnostic.training.threshold_calibration_enabled
 
 

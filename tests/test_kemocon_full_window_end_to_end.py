@@ -305,6 +305,15 @@ def test_five_windows_and_true_missing_control_flow_end_to_end(
     batch = context.batch
     assert batch.speech is not None
     assert batch.physiology is not None
+    assert batch.speech_activity_observed is not None
+    assert batch.speech_activity_observed.tolist() == [
+        True,
+        True,
+        True,
+        True,
+        True,
+        False,
+    ]
     assert batch.speech.waveform.shape == (5, _WINDOW_SAMPLES)
     assert batch.speech.batch_indices.tolist() == [0, 1, 2, 3, 4]
     assert batch.physiology.batch_indices.tolist() == [0, 1, 2, 3, 4, 5]

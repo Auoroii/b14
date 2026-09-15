@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 from torch import Tensor
@@ -30,8 +30,10 @@ class ClassificationMetrics:
     ``confusion_matrix`` is an independent CPU ``torch.long`` tensor
     ``[K, K]`` whose rows are true labels and columns are predictions.
     ``class_support`` is an independent CPU ``torch.long`` tensor ``[K]`` and
-    equals the matrix row sums. Macro precision, recall, and F1 average over
-    all configured classes, so absent classes contribute zero.
+    equals the matrix row sums. ``class_precision``, ``class_recall``, and
+    ``class_f1`` are independent CPU ``torch.float64`` tensors ``[K]``.
+    Macro precision, recall, and F1 average over all configured classes, so
+    absent classes contribute zero.
     ``balanced_accuracy`` instead averages recall only over classes with
     positive true support. With no evaluated rows, every scalar is ``0.0``.
 
@@ -49,6 +51,9 @@ class ClassificationMetrics:
     macro_recall: float
     macro_f1: float
     balanced_accuracy: float
+    class_precision: Tensor = field(init=False)
+    class_recall: Tensor = field(init=False)
+    class_f1: Tensor = field(init=False)
 
     def __post_init__(self) -> None:
         _validate_nonnegative_int(self.num_classes, name="num_classes")
@@ -110,8 +115,12 @@ class ClassificationMetrics:
         # Frozen dataclasses do not make tensors deeply immutable. Defensive
         # copies prevent returned public tensors from sharing accumulator
         # storage with either each other or caller-owned inputs.
+        precision, recall, f1 = _per_class_metrics(matrix)
         object.__setattr__(self, "confusion_matrix", matrix.clone())
         object.__setattr__(self, "class_support", support.clone())
+        object.__setattr__(self, "class_precision", precision)
+        object.__setattr__(self, "class_recall", recall)
+        object.__setattr__(self, "class_f1", f1)
 
 
 def _validate_metric_inputs(
@@ -163,6 +172,16 @@ def _safe_ratio(numerator: Tensor, denominator: Tensor) -> Tensor:
     )
 
 
+def _per_class_metrics(matrix: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """Return CPU float64 precision, recall, and F1 vectors ``[K]``."""
+    matrix_float = matrix.to(dtype=torch.float64)
+    true_positives = matrix_float.diagonal()
+    precision = _safe_ratio(true_positives, matrix_float.sum(dim=0))
+    recall = _safe_ratio(true_positives, matrix_float.sum(dim=1))
+    f1 = _safe_ratio(2.0 * precision * recall, precision + recall)
+    return precision, recall, f1
+
+
 def compute_classification_metrics(
     targets: Tensor,
     predictions: Tensor,
@@ -182,10 +201,11 @@ def compute_classification_metrics(
         ignore_index: Integer outside ``[0, K)``.
 
     Returns:
-        :class:`ClassificationMetrics` with independent CPU long confusion
-        matrix ``[K, K]`` and support ``[K]``. Matrix rows are true labels and
-        columns are predictions. Empty and all-ignored inputs return finite
-        zero metrics.
+        :class:`ClassificationMetrics` with an independent CPU long confusion
+        matrix ``[K, K]`` and support ``[K]``, plus CPU float64 per-class
+        precision, recall, and F1 tensors ``[K]``. Matrix rows are true labels
+        and columns are predictions. Empty and all-ignored inputs return
+        finite zero metrics.
 
     Raises:
         TypeError: If tensor, dtype, or integer contracts are invalid.
@@ -228,13 +248,8 @@ def compute_classification_metrics(
     evaluated_count = int(valid_targets.numel())
     correct_count = int(true_positives.sum().item())
 
-    matrix_float = matrix.to(dtype=torch.float64)
-    true_positive_float = matrix_float.diagonal()
-    support_float = matrix_float.sum(dim=1)
-    predicted_float = matrix_float.sum(dim=0)
-    precision = _safe_ratio(true_positive_float, predicted_float)
-    recall = _safe_ratio(true_positive_float, support_float)
-    f1 = _safe_ratio(2.0 * precision * recall, precision + recall)
+    precision, recall, f1 = _per_class_metrics(matrix)
+    support_float = support.to(dtype=torch.float64)
     supported = support_float > 0
 
     accuracy = (

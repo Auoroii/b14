@@ -17,6 +17,7 @@ from emotion_model.data import AlignedMultimodalBatch, kemocon_channel_specs
 from emotion_model.experiments import (
     KEmoConModalityMode,
     build_kemocon_model,
+    build_kemocon_optimizer,
     load_kemocon_experiment_config,
 )
 from emotion_model.multimodal import (
@@ -230,10 +231,24 @@ def test_builder_selects_new_backend_without_changing_full_window_speech() -> No
     assert config.dataset.window_seconds == 5.0
     assert config.dataset.speech_activity.availability_policy == "source_presence"
     assert config.training.modality_mode is KEmoConModalityMode.MULTIMODAL
-    assert config.training.speech_modality_dropout > 0.0
-    assert config.training.physiology_modality_dropout > 0.0
-    assert config.training.participant_balanced_sampling
+    assert config.training.speech_modality_dropout == pytest.approx(0.1)
+    assert config.training.physiology_modality_dropout == pytest.approx(0.1)
+    assert (
+        config.training.sampling_policy
+        == "bounded_multitask_participant_balanced"
+    )
+    assert config.training.arousal_low_sampling_mass == pytest.approx(0.35)
+    assert config.training.valence_low_sampling_mass == pytest.approx(0.35)
+    assert config.training.max_sampling_weight_ratio == pytest.approx(20.0)
     assert config.training.threshold_calibration_enabled
+    assert config.loss.speech_aux_weight == pytest.approx(0.3)
+    assert config.loss.physiology_aux_weight == pytest.approx(0.1)
+    assert config.training.evaluate_ablation
+    assert config.model.freeze_wavlm
+    assert config.model.unfreeze_last_n_layers == 0
+    assert config.model.emotion_layer_aggregation == "fixed_mean"
+    assert config.training.wavlm_learning_rate == pytest.approx(1.0e-4)
+    assert config.training.min_wavlm_learning_rate is None
     model = _build_configured_model(
         "configs/kemocon_v4_2_full_window_relation_differential.yaml"
     )
@@ -244,6 +259,20 @@ def test_builder_selects_new_backend_without_changing_full_window_speech() -> No
     assert speech.variant == _MODEL_VARIANT
     assert speech.full_window_activity_diagnostics_only
     assert speech.relation_denoiser is not None
+    assert speech.wavlm_encoder.trainable_transformer_layer_indices == ()
+    assert speech.emotion_layer_aggregation.mode == "fixed_mean"
+    layer_logits = speech.emotion_layer_aggregation.emotion_layer_logits
+    assert layer_logits is None
+    optimizer = build_kemocon_optimizer(
+        model,
+        config,
+    )
+    assert [group["group_name"] for group in optimizer.param_groups] == [
+        "downstream"
+    ]
+    assert [group["lr"] for group in optimizer.param_groups] == pytest.approx(
+        [1.0e-4]
+    )
     assert isinstance(
         model.batch_scheduler.physiology_classifier,
         LightweightPhysioEmotionClassifier,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
 
@@ -15,6 +15,10 @@ from emotion_model.data import (
     AlignedMultimodalBatch,
     DatasetPartition,
     ParticipantSplit,
+)
+from emotion_model.evaluation.activity import (
+    SpeechActivityBin,
+    speech_activity_bin_masks,
 )
 from emotion_model.evaluation.calibration import (
     BinaryDecisionThresholds,
@@ -157,11 +161,15 @@ def _validate_prediction_tensor(
 class EvaluationPredictions:
     """Compact detached CPU predictions for ``N`` evaluated records.
 
-    Availability tensors and ``sample_valid`` are boolean CPU tensors ``[N]``.
-    Targets and predictions are long CPU tensors ``[N]``. Original protocol
-    targets are retained; predictions are class indices only on model-valid
-    rows and equal ``ignore_index`` on invalid rows. Construction defensively
-    clones every tensor, so no returned field shares caller storage.
+    Availability, source-presence, activity-observation, and ``sample_valid``
+    tensors are boolean CPU tensors ``[N]``. Activity ratios are a float32 CPU
+    diagnostic tensor ``[N]`` and have no model role. Optional retained shared
+    modality weights are a detached floating CPU tensor ``[N,2]`` in
+    ``[speech, physiology]`` order. Targets and predictions are long CPU
+    tensors ``[N]``. Original protocol targets are retained; predictions are
+    class indices only on model-valid rows and equal ``ignore_index`` on
+    invalid rows. Construction defensively clones every tensor, so no returned
+    field shares caller storage.
     """
 
     sample_ids: tuple[str, ...]
@@ -176,6 +184,16 @@ class EvaluationPredictions:
     quadrant_targets: Tensor
     quadrant_predictions: Tensor
     ignore_index: int
+    speech_source_present: Tensor = field(
+        default_factory=lambda: torch.empty(0, dtype=torch.bool)
+    )
+    speech_activity_observed: Tensor = field(
+        default_factory=lambda: torch.empty(0, dtype=torch.bool)
+    )
+    speech_activity_ratios: Tensor = field(
+        default_factory=lambda: torch.empty(0, dtype=torch.float32)
+    )
+    modality_weights: Tensor | None = None
 
     def __post_init__(self) -> None:
         _validate_ids(self.sample_ids, name="sample_ids", unique=True)
@@ -222,6 +240,96 @@ class EvaluationPredictions:
                 dtype=torch.long,
             )
             object.__setattr__(self, name, value.detach().clone())
+
+        diagnostic_specs = (
+            ("speech_source_present", torch.bool),
+            ("speech_activity_observed", torch.bool),
+            ("speech_activity_ratios", torch.float32),
+        )
+        for name, dtype in diagnostic_specs:
+            value = getattr(self, name)
+            if (
+                isinstance(value, Tensor)
+                and tuple(value.shape) == (0,)
+                and length > 0
+            ):
+                value = torch.zeros(length, dtype=dtype)
+            value = _validate_prediction_tensor(
+                value,
+                name=name,
+                length=length,
+                dtype=dtype,
+            )
+            if name == "speech_activity_ratios" and not bool(
+                torch.isfinite(value).all()
+                and (value >= 0.0).all()
+                and (value <= 1.0).all()
+            ):
+                raise ValueError(
+                    "speech_activity_ratios must be finite in [0, 1]."
+                )
+            object.__setattr__(self, name, value.detach().clone())
+        if bool(
+            (
+                self.speech_activity_observed
+                & ~self.speech_source_present
+            ).any()
+        ):
+            raise ValueError(
+                "speech activity can be observed only for a real source."
+            )
+
+        weights = self.modality_weights
+        if weights is not None:
+            if not isinstance(weights, Tensor) or not weights.is_floating_point():
+                raise TypeError("modality_weights must be a floating Tensor or None.")
+            if weights.device.type != "cpu":
+                raise ValueError("modality_weights must be on CPU.")
+            if tuple(weights.shape) != (length, 2):
+                raise ValueError(
+                    "modality_weights must have shape "
+                    f"[{length}, 2]; received {tuple(weights.shape)}."
+                )
+            if not bool(
+                torch.isfinite(weights).all()
+                and (weights >= 0.0).all()
+                and (weights <= 1.0).all()
+            ):
+                raise ValueError("modality_weights must be finite in [0, 1].")
+            both = self.speech_available & self.physiology_available
+            speech_only = self.speech_available & ~self.physiology_available
+            physiology_only = ~self.speech_available & self.physiology_available
+            neither = ~self.sample_valid
+            if not torch.allclose(
+                weights[both].sum(dim=1),
+                torch.ones_like(weights[both, 0]),
+                rtol=1.0e-5,
+                atol=1.0e-6,
+            ):
+                raise ValueError(
+                    "both-available modality weights must sum to one."
+                )
+            if not torch.equal(
+                weights[speech_only],
+                torch.tensor(
+                    [1.0, 0.0],
+                    dtype=weights.dtype,
+                ).expand(int(speech_only.sum().item()), -1),
+            ):
+                raise ValueError("speech-only modality weights must equal [1, 0].")
+            if not torch.equal(
+                weights[physiology_only],
+                torch.tensor(
+                    [0.0, 1.0],
+                    dtype=weights.dtype,
+                ).expand(int(physiology_only.sum().item()), -1),
+            ):
+                raise ValueError(
+                    "physiology-only modality weights must equal [0, 1]."
+                )
+            if not torch.equal(weights[neither], torch.zeros_like(weights[neither])):
+                raise ValueError("invalid-row modality weights must be exact zero.")
+            object.__setattr__(self, "modality_weights", weights.detach().clone())
 
         expected_valid = self.speech_available | self.physiology_available
         if not torch.equal(self.sample_valid, expected_valid):
@@ -839,7 +947,11 @@ def evaluate_participant_independent(
     participant_ids: list[str] = []
     speech_available: list[Tensor] = []
     physiology_available: list[Tensor] = []
-    speech_activity_ratios: list[Tensor] = []
+    speech_source_present: list[Tensor] = []
+    speech_activity_observed: list[Tensor] = []
+    aligned_speech_activity_ratios: list[Tensor] = []
+    observed_speech_activity_ratios: list[Tensor] = []
+    modality_weights_rows: list[Tensor] = []
     speech_source_unavailable_count = 0
     sample_valid: list[Tensor] = []
     arousal_targets: list[Tensor] = []
@@ -977,6 +1089,9 @@ def evaluate_participant_independent(
         _validate_probability_output(output, batch)
         fusion_output = output.fusion_output
         modality_weights = fusion_output.modality_weights
+        modality_weights_rows.append(
+            modality_weights.detach().clone().cpu()
+        )
         both = (batch.speech_available & batch.physiology_available).to(
             device=fusion_output.fused_embedding.device
         )
@@ -990,10 +1105,27 @@ def evaluate_participant_independent(
                 ratio = batch.speech_activity_ratios.to(
                     device=fusion_output.fused_embedding.device
                 )
+                if batch.speech_activity_observed is None:
+                    raise RuntimeError(
+                        "activity ratios require an observation mask."
+                    )
+                activity_observed = batch.speech_activity_observed.to(
+                    device=fusion_output.fused_embedding.device
+                )
+                activity_masks = speech_activity_bin_masks(
+                    ratio,
+                    both & activity_observed,
+                )
                 bucket_masks = {
-                    "low": both & (ratio >= 0.10) & (ratio < 0.25),
-                    "medium": both & (ratio >= 0.25) & (ratio < 0.50),
-                    "high": both & (ratio >= 0.50),
+                    "low": activity_masks[
+                        SpeechActivityBin.RATIO_0_1_TO_0_25
+                    ],
+                    "medium": activity_masks[
+                        SpeechActivityBin.RATIO_0_25_TO_0_5
+                    ],
+                    "high": activity_masks[
+                        SpeechActivityBin.RATIO_GE_0_5
+                    ],
                 }
                 for bucket_name, bucket_mask in bucket_masks.items():
                     bucket_count = int(bucket_mask.sum().item())
@@ -1014,13 +1146,33 @@ def evaluate_participant_independent(
             [record.speech_source is not None for record in batch.records],
             dtype=torch.bool,
         )
+        speech_source_present.append(source_present)
         speech_source_unavailable_count += int((~source_present).sum().item())
         physiology_available.append(
             batch.physiology_available.detach().clone().cpu()
         )
-        if batch.speech_activity_ratios is not None and bool(source_present.any()):
-            speech_activity_ratios.append(
-                batch.speech_activity_ratios[source_present]
+        batch_activity_observed = torch.zeros_like(source_present)
+        batch_activity_ratios = torch.zeros(
+            len(batch.records),
+            dtype=torch.float32,
+        )
+        if batch.speech_activity_ratios is not None:
+            if batch.speech_activity_observed is None:
+                raise RuntimeError(
+                    "activity ratios require an observation mask."
+                )
+            batch_activity_ratios = (
+                batch.speech_activity_ratios.detach().clone().cpu()
+            )
+            batch_activity_observed = (
+                batch.speech_activity_observed
+                & source_present
+            ).detach().clone().cpu()
+        speech_activity_observed.append(batch_activity_observed)
+        aligned_speech_activity_ratios.append(batch_activity_ratios)
+        if bool(batch_activity_observed.any()):
+            observed_speech_activity_ratios.append(
+                batch_activity_ratios[batch_activity_observed]
                 .detach()
                 .clone()
                 .cpu()
@@ -1093,6 +1245,10 @@ def evaluate_participant_independent(
         quadrant_targets=torch.cat(quadrant_targets),
         quadrant_predictions=calibrated_predictions[2],
         ignore_index=ignore_index,
+        speech_source_present=torch.cat(speech_source_present),
+        speech_activity_observed=torch.cat(speech_activity_observed),
+        speech_activity_ratios=torch.cat(aligned_speech_activity_ratios),
+        modality_weights=torch.cat(modality_weights_rows),
     )
     working_targets = _working_targets(evaluation_predictions)
     all_rows = torch.ones(len(sample_ids), dtype=torch.bool)
@@ -1201,8 +1357,10 @@ def evaluate_participant_independent(
         fusion_diagnostics["shared_gate_both_count"] = float(
             shared_gate_both_count
         )
-    if speech_activity_ratios:
-        ratios = torch.cat(speech_activity_ratios).to(dtype=torch.float64)
+    if observed_speech_activity_ratios:
+        ratios = torch.cat(observed_speech_activity_ratios).to(
+            dtype=torch.float64
+        )
         fusion_diagnostics.update(
             {
                 "speech_available_count": float(

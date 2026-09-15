@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import platform
+import statistics
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import cast
 
 import torch
 import transformers
@@ -17,13 +20,18 @@ import yaml  # type: ignore[import-untyped]
 from emotion_model.common import LabelProtocol, binarize_emotion_scores
 from emotion_model.data import (
     AlignedMultimodalBatch,
+    AlignedMultimodalSample,
     MultimodalWindowRecord,
     PartitionedManifest,
 )
 from emotion_model.evaluation import (
     ClassificationMetrics,
     EmotionTaskMetrics,
+    EvaluationPredictions,
     ParticipantIndependentEvaluationOutput,
+    SpeechActivityBin,
+    compute_speech_activity_strata,
+    speech_activity_bin_masks,
 )
 
 
@@ -92,17 +100,32 @@ class FullWindowSpeechAvailabilityStatistics:
         ratios = natural_batch.speech_activity_ratios
         if ratios is None:
             return
-        observed = ratios[source_present]
-        self.speech_activity_ratio_observed += observed.numel()
-        self.speech_activity_ratio_eq_0 += int((observed == 0.0).sum().item())
+        observed = natural_batch.speech_activity_observed
+        if observed is None:
+            raise RuntimeError(
+                "activity ratios require an aligned observation mask."
+            )
+        bin_masks = speech_activity_bin_masks(
+            ratios,
+            source_present & observed,
+        )
+        self.speech_activity_ratio_observed += int(
+            sum(mask.sum().item() for mask in bin_masks.values())
+        )
+        self.speech_activity_ratio_eq_0 += int(
+            bin_masks[SpeechActivityBin.RATIO_EQ_0].sum().item()
+        )
         self.speech_activity_ratio_0_to_0_1 += int(
-            ((observed > 0.0) & (observed < 0.1)).sum().item()
+            bin_masks[SpeechActivityBin.RATIO_0_TO_0_1].sum().item()
         )
         self.speech_activity_ratio_0_1_to_0_25 += int(
-            ((observed >= 0.1) & (observed < 0.25)).sum().item()
+            bin_masks[SpeechActivityBin.RATIO_0_1_TO_0_25].sum().item()
         )
         self.speech_activity_ratio_ge_0_25 += int(
-            (observed >= 0.25).sum().item()
+            (
+                bin_masks[SpeechActivityBin.RATIO_0_25_TO_0_5].sum()
+                + bin_masks[SpeechActivityBin.RATIO_GE_0_5].sum()
+            ).item()
         )
 
     def to_summary(self) -> dict[str, int]:
@@ -423,6 +446,298 @@ def _record_partition_summary(
     }
 
 
+def _availability_pattern(speech: bool, physiology: bool) -> str:
+    if speech and physiology:
+        return "both"
+    if speech:
+        return "speech_only"
+    if physiology:
+        return "physiology_only"
+    return "neither"
+
+
+def _empty_runtime_label_distribution() -> dict[str, object]:
+    return {
+        "record_count": 0,
+        "arousal": {"low": 0, "high": 0, "ignored": 0},
+        "valence": {"low": 0, "high": 0, "ignored": 0},
+        "quadrant": {
+            "LALV": 0,
+            "HALV": 0,
+            "LAHV": 0,
+            "HAHV": 0,
+            "ignored": 0,
+        },
+    }
+
+
+def _increment_runtime_label_distribution(
+    distribution: dict[str, object],
+    sample: AlignedMultimodalSample,
+) -> None:
+    distribution["record_count"] = int(distribution["record_count"]) + 1
+    for task, label in (
+        ("arousal", sample.arousal_label),
+        ("valence", sample.valence_label),
+    ):
+        counts = cast(dict[str, int], distribution[task])
+        name = {0: "low", 1: "high"}.get(label, "ignored")
+        counts[name] += 1
+    quadrant = cast(dict[str, int], distribution["quadrant"])
+    quadrant_name = {
+        0: "LALV",
+        1: "HALV",
+        2: "LAHV",
+        3: "HAHV",
+    }.get(sample.quadrant_label, "ignored")
+    quadrant[quadrant_name] += 1
+
+
+def build_runtime_availability_audit(
+    samples: Iterable[AlignedMultimodalSample],
+) -> dict[str, object]:
+    """Compare manifest declarations with loaded runtime availability.
+
+    Args:
+        samples: One complete pass of aligned samples. Speech tensors are
+            ``[L]`` and physiology tensors/masks are ``[T,C]``; this function
+            reads only metadata and boolean availability fields.
+
+    Returns:
+        JSON-compatible declaration-to-runtime modality transitions, mismatch
+        sample IDs, per-participant counts, and per-channel physiology counts.
+        Input samples and tensors are not modified.
+    """
+
+    transition_counts = {
+        declared: {runtime: 0 for runtime in _DECLARED_MODALITY_PATTERNS}
+        for declared in _DECLARED_MODALITY_PATTERNS
+    }
+    modality_counts = {
+        name: {
+            "declared_count": 0,
+            "runtime_available_count": 0,
+            "declared_but_runtime_unavailable_count": 0,
+            "runtime_available_without_declaration_count": 0,
+        }
+        for name in ("speech", "physiology")
+    }
+    participant_counts: dict[str, dict[str, object]] = {}
+    declared_channel_counts: dict[str, int] = {}
+    runtime_channel_counts: dict[str, int] = {}
+    mismatch_sample_ids: list[str] = []
+    runtime_label_distributions = {
+        pattern: _empty_runtime_label_distribution()
+        for pattern in _DECLARED_MODALITY_PATTERNS
+    }
+    mismatch_label_distribution = _empty_runtime_label_distribution()
+    seen_sample_ids: set[str] = set()
+    record_count = 0
+
+    for sample in samples:
+        if not isinstance(sample, AlignedMultimodalSample):
+            raise TypeError("samples must contain AlignedMultimodalSample objects.")
+        sample_id = sample.record.sample_id
+        if sample_id in seen_sample_ids:
+            raise ValueError(f"duplicate runtime audit sample_id: {sample_id!r}.")
+        seen_sample_ids.add(sample_id)
+        record_count += 1
+
+        declared_speech = sample.record.speech_source is not None
+        declared_physiology = bool(sample.record.physio_sources)
+        runtime_speech = sample.speech_available
+        runtime_physiology = sample.physiology_available
+        declared_pattern = _availability_pattern(
+            declared_speech,
+            declared_physiology,
+        )
+        runtime_pattern = _availability_pattern(runtime_speech, runtime_physiology)
+        transition_counts[declared_pattern][runtime_pattern] += 1
+        _increment_runtime_label_distribution(
+            runtime_label_distributions[runtime_pattern],
+            sample,
+        )
+        if declared_pattern != runtime_pattern:
+            mismatch_sample_ids.append(sample_id)
+            _increment_runtime_label_distribution(
+                mismatch_label_distribution,
+                sample,
+            )
+
+        participant = participant_counts.setdefault(
+            sample.record.participant_id,
+            {
+                "record_count": 0,
+                "declared_physiology_count": 0,
+                "runtime_physiology_available_count": 0,
+                "physiology_mismatch_count": 0,
+            },
+        )
+        participant["record_count"] = int(participant["record_count"]) + 1
+
+        for name, declared, runtime in (
+            ("speech", declared_speech, runtime_speech),
+            ("physiology", declared_physiology, runtime_physiology),
+        ):
+            counts = modality_counts[name]
+            counts["declared_count"] += int(declared)
+            counts["runtime_available_count"] += int(runtime)
+            counts["declared_but_runtime_unavailable_count"] += int(
+                declared and not runtime
+            )
+            counts["runtime_available_without_declaration_count"] += int(
+                runtime and not declared
+            )
+        participant["declared_physiology_count"] = int(
+            participant["declared_physiology_count"]
+        ) + int(declared_physiology)
+        participant["runtime_physiology_available_count"] = int(
+            participant["runtime_physiology_available_count"]
+        ) + int(runtime_physiology)
+        participant["physiology_mismatch_count"] = int(
+            participant["physiology_mismatch_count"]
+        ) + int(declared_physiology != runtime_physiology)
+
+        declared_channels = {
+            source.channel_name for source in sample.record.physio_sources
+        }
+        for channel_name in declared_channels:
+            declared_channel_counts[channel_name] = (
+                declared_channel_counts.get(channel_name, 0) + 1
+            )
+        if sample.physio_channel_mask is not None:
+            for channel_name, available in zip(
+                sample.channel_names,
+                sample.physio_channel_mask.tolist(),
+                strict=True,
+            ):
+                runtime_channel_counts[channel_name] = (
+                    runtime_channel_counts.get(channel_name, 0) + int(available)
+                )
+
+    channel_names = sorted(set(declared_channel_counts) | set(runtime_channel_counts))
+    return {
+        "record_count": record_count,
+        "modality_counts": modality_counts,
+        "declared_to_runtime_pattern_counts": transition_counts,
+        "mismatch_count": len(mismatch_sample_ids),
+        "mismatch_sample_ids": mismatch_sample_ids,
+        "runtime_modality_label_distributions": runtime_label_distributions,
+        "mismatch_label_distribution": mismatch_label_distribution,
+        "participant_counts": {
+            participant_id: participant_counts[participant_id]
+            for participant_id in sorted(participant_counts)
+        },
+        "physiology_channel_counts": {
+            channel_name: {
+                "declared_count": declared_channel_counts.get(channel_name, 0),
+                "runtime_available_count": runtime_channel_counts.get(
+                    channel_name,
+                    0,
+                ),
+            }
+            for channel_name in channel_names
+        },
+    }
+
+
+def build_cross_fold_evaluation_summary(
+    fold_summaries: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    """Aggregate completed participant-independent fold metrics.
+
+    Args:
+        fold_summaries: Per-fold evaluation mappings containing scalar overall
+            arousal/valence metrics and disjoint ``participant_ids`` lists.
+
+    Returns:
+        JSON-compatible per-fold values plus population mean and standard
+        deviation. Duplicate fold indices or test participants are rejected.
+    """
+
+    if not fold_summaries:
+        raise ValueError("fold_summaries must be non-empty.")
+    metric_paths = tuple(
+        (task, metric)
+        for task in ("arousal", "valence")
+        for metric in ("accuracy", "macro_f1", "balanced_accuracy")
+    )
+    values: dict[str, list[float]] = {
+        f"overall.{task}.{metric}": [] for task, metric in metric_paths
+    }
+    for task in ("arousal", "valence"):
+        for label in ("low", "high"):
+            for metric in ("recall", "f1", "support"):
+                values[f"overall.{task}.per_class.{label}.{metric}"] = []
+
+    fold_indices: list[int] = []
+    test_participants: list[str] = []
+    fold_records: list[dict[str, object]] = []
+    for summary in fold_summaries:
+        fold_index = summary.get("fold_index")
+        if isinstance(fold_index, bool) or not isinstance(fold_index, int):
+            raise TypeError("every fold summary must contain an integer fold_index.")
+        if fold_index in fold_indices:
+            raise ValueError(f"duplicate fold_index: {fold_index}.")
+        fold_indices.append(fold_index)
+        raw_participants = summary.get("participant_ids")
+        if not isinstance(raw_participants, list) or not all(
+            isinstance(value, str) for value in raw_participants
+        ):
+            raise TypeError("every fold summary must contain string participant_ids.")
+        participants = cast(list[str], raw_participants)
+        duplicate_participants = set(test_participants) & set(participants)
+        if duplicate_participants:
+            raise ValueError(
+                "test participants occur in multiple folds: "
+                f"{sorted(duplicate_participants)}."
+            )
+        test_participants.extend(participants)
+        overall = summary.get("overall")
+        if not isinstance(overall, Mapping):
+            raise TypeError("every fold summary must contain an overall mapping.")
+        per_fold_metrics: dict[str, float] = {}
+        for path in values:
+            current: object = overall
+            for component in path.split(".")[1:]:
+                if not isinstance(current, Mapping) or component not in current:
+                    raise ValueError(f"fold {fold_index} is missing metric {path}.")
+                current = current[component]
+            if isinstance(current, bool) or not isinstance(current, (int, float)):
+                raise TypeError(f"fold {fold_index} metric {path} must be numeric.")
+            number = float(current)
+            if not math.isfinite(number):
+                raise ValueError(f"fold {fold_index} metric {path} must be finite.")
+            values[path].append(number)
+            per_fold_metrics[path] = number
+        fold_records.append(
+            {
+                "fold_index": fold_index,
+                "record_count": summary.get("record_count"),
+                "participant_ids": participants,
+                "participants": summary.get("participants", []),
+                "metrics": per_fold_metrics,
+            }
+        )
+
+    return {
+        "fold_count": len(fold_summaries),
+        "fold_indices": fold_indices,
+        "test_participant_count": len(test_participants),
+        "test_participant_ids": test_participants,
+        "aggregation": "unweighted_fold_mean_population_std",
+        "metrics": {
+            path: {
+                "mean": statistics.fmean(numbers),
+                "std": statistics.pstdev(numbers),
+                "fold_values": numbers,
+            }
+            for path, numbers in values.items()
+        },
+        "folds": fold_records,
+    }
+
+
 def build_split_summary(
     partitioned: PartitionedManifest,
     *,
@@ -479,10 +794,23 @@ def build_split_summary(
 def classification_metrics_summary(
     metrics: ClassificationMetrics,
 ) -> dict[str, object]:
-    """Convert one CPU ``[K,K]`` confusion-matrix result to JSON values."""
+    """Convert one CPU ``[K,K]`` confusion-matrix result to JSON values.
+
+    Binary classes use the K-EmoCon ``low``, ``high`` order. Quadrant classes
+    use ``LALV``, ``HALV``, ``LAHV``, ``HAHV``; other class counts receive
+    stable zero-based names. Every per-class entry contains Python numeric
+    precision, recall, F1, and support values suitable for JSON encoding.
+    """
 
     if not isinstance(metrics, ClassificationMetrics):
         raise TypeError("metrics must be ClassificationMetrics.")
+    class_names = {
+        2: ("low", "high"),
+        4: ("LALV", "HALV", "LAHV", "HAHV"),
+    }.get(
+        metrics.num_classes,
+        tuple(f"class_{index}" for index in range(metrics.num_classes)),
+    )
     return {
         "evaluated_count": metrics.evaluated_count,
         "correct_count": metrics.correct_count,
@@ -493,6 +821,15 @@ def classification_metrics_summary(
         "balanced_accuracy": metrics.balanced_accuracy,
         "confusion_matrix": metrics.confusion_matrix.tolist(),
         "class_support": metrics.class_support.tolist(),
+        "per_class": {
+            name: {
+                "precision": float(metrics.class_precision[index].item()),
+                "recall": float(metrics.class_recall[index].item()),
+                "f1": float(metrics.class_f1[index].item()),
+                "support": int(metrics.class_support[index].item()),
+            }
+            for index, name in enumerate(class_names)
+        },
     }
 
 
@@ -505,6 +842,27 @@ def emotion_metrics_summary(metrics: EmotionTaskMetrics) -> dict[str, object]:
         "arousal": classification_metrics_summary(metrics.arousal),
         "valence": classification_metrics_summary(metrics.valence),
         "quadrant": classification_metrics_summary(metrics.quadrant),
+    }
+
+
+def speech_activity_stratified_summary(
+    predictions: EvaluationPredictions,
+) -> dict[str, object]:
+    """Summarize five reporting-only activity strata from CPU rows ``[N]``."""
+
+    return {
+        stratum.activity_bin.value: {
+            "record_count": stratum.record_count,
+            "participant_count": stratum.participant_count,
+            "arousal": classification_metrics_summary(stratum.arousal),
+            "valence": classification_metrics_summary(stratum.valence),
+            "fusion": {
+                "availability_patterns": dict(stratum.availability_patterns),
+                "all_valid": asdict(stratum.all_valid_fusion),
+                "both_available": asdict(stratum.both_available_fusion),
+            },
+        }
+        for stratum in compute_speech_activity_strata(predictions)
     }
 
 
@@ -538,6 +896,9 @@ def build_evaluation_summary(
         },
         "loss": asdict(result.loss_epoch.loss_averages),
         "overall": emotion_metrics_summary(result.overall_metrics),
+        "speech_activity_stratified": speech_activity_stratified_summary(
+            result.predictions
+        ),
         "participant_macro": asdict(result.participant_macro_metrics),
         "binary_decision_thresholds": (
             result.binary_decision_thresholds.to_metadata()
@@ -610,9 +971,12 @@ __all__ = [
     "build_ablation_evaluation_summary",
     "build_environment_summary",
     "build_evaluation_summary",
+    "build_cross_fold_evaluation_summary",
+    "build_runtime_availability_audit",
     "build_split_summary",
     "classification_metrics_summary",
     "emotion_metrics_summary",
+    "speech_activity_stratified_summary",
     "write_effective_config_snapshot",
     "write_json_artifact",
 ]

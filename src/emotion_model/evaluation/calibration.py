@@ -12,7 +12,7 @@ from torch import Tensor
 from emotion_model.evaluation.metrics import compute_classification_metrics
 
 _CALIBRATION_POLICY = (
-    "validation_equal_participant_macro_f1_grid_0.05_0.95_step_0.01"
+    "validation_pooled_macro_f1_grid_0.05_0.95_step_0.01"
 )
 _DEFAULT_POLICY = "fixed_high_probability_threshold_0.5"
 
@@ -139,10 +139,9 @@ def _validate_calibration_inputs(
     return ids
 
 
-def _participant_macro_f1(
+def _pooled_macro_f1(
     high_probabilities: Tensor,
     targets: Tensor,
-    participant_ids: tuple[str, ...],
     sample_valid: Tensor,
     *,
     threshold: float,
@@ -151,27 +150,18 @@ def _participant_macro_f1(
     predictions = (high_probabilities > threshold).to(dtype=torch.long)
     working_targets = targets.clone()
     working_targets[~sample_valid] = ignore_index
-    ordered_ids = tuple(dict.fromkeys(participant_ids))
-    values: list[float] = []
-    for participant_id in ordered_ids:
-        rows = torch.tensor(
-            [value == participant_id for value in participant_ids],
-            dtype=torch.bool,
-        )
-        metrics = compute_classification_metrics(
-            working_targets[rows],
-            predictions[rows],
-            num_classes=2,
-            ignore_index=ignore_index,
-        )
-        if metrics.evaluated_count > 0:
-            values.append(metrics.macro_f1)
-    if not values:
-        raise ValueError("threshold calibration has no evaluable participant.")
-    return sum(values) / len(values)
+    metrics = compute_classification_metrics(
+        working_targets,
+        predictions,
+        num_classes=2,
+        ignore_index=ignore_index,
+    )
+    if metrics.evaluated_count == 0:
+        raise ValueError("threshold calibration has no evaluable sample.")
+    return metrics.macro_f1
 
 
-def select_equal_participant_macro_f1_threshold(
+def select_pooled_macro_f1_threshold(
     high_probabilities: Tensor,
     targets: Tensor,
     participant_ids: Sequence[str],
@@ -184,18 +174,20 @@ def select_equal_participant_macro_f1_threshold(
     Args:
         high_probabilities: Detached floating CPU tensor ``[N]``.
         targets: Binary long CPU labels ``[N]`` with ``ignore_index`` allowed.
-        participant_ids: Participant identifier for every row.
+        participant_ids: Participant identifier for every row, retained to
+            validate row alignment and prevent accidental partition mixing.
         sample_valid: Boolean CPU tensor ``[N]`` with ``True=valid``.
         ignore_index: Label sentinel outside the binary classes.
 
     Returns:
         A Python float from the fixed 91-point grid. The primary objective is
-        equal-participant macro-F1. Ties prefer the threshold closest to 0.5,
-        then the smaller threshold. Test rows are never accepted separately;
-        callers must pass only their validation partition.
+        pooled binary macro-F1, which weights Low and High F1 equally without
+        giving High-only participants separate objective mass. Ties prefer the
+        threshold closest to 0.5, then the smaller threshold. Test rows are
+        never accepted separately; callers must pass validation only.
     """
 
-    ids = _validate_calibration_inputs(
+    _validate_calibration_inputs(
         high_probabilities,
         targets,
         participant_ids,
@@ -211,10 +203,9 @@ def select_equal_participant_macro_f1_threshold(
     return max(
         candidates,
         key=lambda threshold: (
-            _participant_macro_f1(
+            _pooled_macro_f1(
                 high_probabilities,
                 targets,
-                ids,
                 sample_valid,
                 threshold=threshold,
                 ignore_index=ignore_index,
@@ -238,14 +229,14 @@ def calibrate_binary_decision_thresholds(
     """Select independent validation thresholds from CPU vectors ``[N]``."""
 
     return BinaryDecisionThresholds(
-        arousal_high=select_equal_participant_macro_f1_threshold(
+        arousal_high=select_pooled_macro_f1_threshold(
             arousal_high_probabilities,
             arousal_targets,
             participant_ids,
             sample_valid,
             ignore_index=ignore_index,
         ),
-        valence_high=select_equal_participant_macro_f1_threshold(
+        valence_high=select_pooled_macro_f1_threshold(
             valence_high_probabilities,
             valence_targets,
             participant_ids,
@@ -259,5 +250,5 @@ def calibrate_binary_decision_thresholds(
 __all__ = [
     "BinaryDecisionThresholds",
     "calibrate_binary_decision_thresholds",
-    "select_equal_participant_macro_f1_threshold",
+    "select_pooled_macro_f1_threshold",
 ]

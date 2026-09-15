@@ -14,7 +14,7 @@
 
 每条 manifest record 表示同一参与者、同一会话中的半开 5 秒时间窗。语音目标采样率为 16 kHz，因此完整窗口为 80000 个采样点。生理信号包含配置中声明的 BVP、EDA、TEMP 通道，并按显式单位、原始采样率和目标时间轴处理。
 
-split 以 debate dyad/session 为隔离单位，训练、验证、测试参与者不得交叉。默认配置使用固定比例和确定性 seed。生理归一化统计只能从训练分区拟合。
+split 以 debate dyad/session 为隔离单位，训练、验证、测试参与者不得交叉。默认配置使用 5-fold label-stratified rotating splits 和确定性 seed；每个参与者恰好作为测试参与者一次。生理归一化统计只能从当前 fold 的训练分区拟合。每个 fold 必须审计 manifest 声明可用性与实际加载后的模态/通道可用性，完整实验必须汇总 fold 均值与标准差。
 
 ## 3. Speech availability 与 activity diagnostics
 
@@ -47,7 +47,7 @@ split 以 debate dyad/session 为隔离单位，训练、验证、测试参与�
 - modulation：有界 FiLM
 - 输出：共享 speech embedding，以及 arousal/valence 辅助 logits
 
-WavLM 默认冻结；配置可解冻最后若干层。全零有效 waveform 必须返回 finite embedding，不能因 activity diagnostics 全 false 而失败。
+当前稳定配置完全冻结 WavLM，并对 H9–H12 使用固定均值聚合。顶部 H12 微调造成 Arousal Low 塌缩，可学习 H9–H12 聚合又未产生可测收益，因此两项均不保留。全零有效 waveform 必须返回 finite embedding，不能因 activity diagnostics 全 false 而失败。
 
 ## 6. Physiology branch
 
@@ -74,7 +74,11 @@ WavLM 默认冻结；配置可解冻最后若干层。全零有效 waveform 必�
 
 `MultimodalEmotionClassifier` 的 arousal 和 valence head 均从同一个 shared classifier trunk 和 `fused_embedding` 预测，不存在 task-specific fusion weights。quadrant 概率由两项二分类概率推导。
 
-目标函数使用 class-weighted cross entropy；speech 和 physiology 辅助损失由配置加权。只对 label 与 sample validity 都有效的条目计入损失。人工 modality dropout 属于训练时缺失模拟，但不得产生双模态同时被丢弃的样本。
+目标函数使用 class-weighted cross entropy；当前单变量采样实验将 speech auxiliary loss 保持为 0.3，physiology auxiliary loss 保持为 0.1。只对 label 与 sample validity 都有效的条目计入损失。人工 modality dropout 属于训练时缺失模拟，但不得产生双模态同时被丢弃的样本。
+
+测试必须启用 same-window modality ablation：只在自然状态下 speech 与 physiology 都可用的测试窗口上分别执行 speech-only 和 physiology-only 推理。该诊断不得参与训练、阈值拟合或 checkpoint 选择。
+
+训练 sampler 必须采用有界的 Arousal/Valence 联合类别—参与者感知权重：两个任务的 Low/High 目标采样质量均为 0.35/0.65，以任务—类别内参与者均衡初始化，并限制最大/最小样本权重比为 20。该策略与 class-weighted cross entropy 配合，避免单任务采样牺牲另一任务或少数窗口过度重复。阈值校准仅使用当前 fold 验证集的 pooled binary macro-F1；不得使用测试标签。
 
 ## 9. 训练、评估与 checkpoint
 

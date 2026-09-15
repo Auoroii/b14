@@ -14,7 +14,7 @@
 
 语音可用性采用 `source_presence`：音频源存在并成功读取即为可用。完整静音、极短发声和短时发声都是有效语音窗口；`speech_activity_mask` 与 `speech_activity_ratio` 只用于诊断统计，不参与可用性、路由、WavLM mask、池化、FiLM、融合或损失。
 
-语音路径：完整 waveform → WavLM → H9–H12 情感表征 → H1–H2 声学/噪声条件 → relation differential → bounded FiLM → speech embedding。
+语音路径：完整 waveform → WavLM → 固定均值聚合的 H9–H12 情感表征 → H1–H2 声学/噪声条件 → relation differential → bounded FiLM → speech embedding。当前稳定配置完全冻结 WavLM；顶部解冻和可学习层聚合在 fold 0 未产生可靠的整体收益，因此不保留在生产实验配置中。
 
 生理路径：对齐、伪迹处理与训练集归一化 → 当前轻量生理分类器 → physiology embedding。
 
@@ -35,7 +35,7 @@ python scripts/cache_wavlm.py --help
 ```bash
 python scripts/prepare_kemocon.py --config configs/kemocon_v4_2_full_window_relation_differential.yaml
 python scripts/validate_kemocon.py --config configs/kemocon_v4_2_full_window_relation_differential.yaml
-python scripts/train_kemocon.py --config configs/kemocon_v4_2_full_window_relation_differential.yaml
+python scripts/train_kemocon.py --config configs/kemocon_v4_2_full_window_relation_differential.yaml --all-folds
 python scripts/evaluate_kemocon.py --config configs/kemocon_v4_2_full_window_relation_differential.yaml
 ```
 
@@ -60,6 +60,12 @@ python -m pytest -q
 - `history.jsonl`：逐 epoch 训练记录
 - `test_metrics.json`：测试评估结果
 - `training_summary.json` 和 `train.log`：运行摘要与日志
+
+完整重复实验使用 5-fold label-stratified、dyad-safe rotating splits。每个参与者恰好作为测试参与者一次；全部 fold 完成后写入 `cross_fold_summary.json`，其中包含 fold 均值、总体标准差、逐 fold 指标和各 fold 的运行时模态可用性审计。`split_summary.json` 同时保留 manifest 声明数量与实际加载后的 speech/physiology 可用数量、按参与者差异、按 physiology 通道差异及 mismatch sample ID。
+
+训练采样采用 `bounded_multitask_participant_balanced`：Arousal 与 Valence 的 Low/High 目标采样质量均为 0.35/0.65，以任务—类别内参与者均衡作为初始化，再联合校准两个任务的边际质量；单样本最大/最小权重比限制为 20，避免极少数窗口被反复抽取。验证阈值按 pooled binary macro-F1 选择，Low 与 High F1 等权。
+
+当前单变量采样实验保持 speech auxiliary loss 权重为 0.3、physiology auxiliary loss 为 0.1，仅把采样策略改为双任务有界采样。测试启用 same-window modality ablation，在原本 speech 与 physiology 都可用的同一组窗口上分别屏蔽一种模态，用于判断语音独立判别能力，ablation 不参与训练或 checkpoint 选择。
 
 ## 关键约束
 

@@ -482,6 +482,8 @@ class AlignedMultimodalBatch:
         physiology: Compact rows selected by ``physiology_available``, or
             ``None``.
         speech_activity_ratios: Optional float32 diagnostic tensor ``[B]``.
+        speech_activity_observed: Optional boolean diagnostic tensor ``[B]``;
+            true only where the corresponding ratio is observable.
 
     The modality subbatch ``batch_indices`` must exactly equal the corresponding
     availability nonzero indices. Fully unavailable logical rows remain in the
@@ -501,6 +503,7 @@ class AlignedMultimodalBatch:
     speech: SpeechSubBatch | None
     physiology: PhysioSubBatch | None
     speech_activity_ratios: Tensor | None = None
+    speech_activity_observed: Tensor | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -626,6 +629,7 @@ class AlignedMultimodalBatch:
             name="physiology",
         )
         activity_ratios = self.speech_activity_ratios
+        activity_observed = self.speech_activity_observed
         if activity_ratios is not None:
             if (
                 activity_ratios.dtype != torch.float32
@@ -641,6 +645,36 @@ class AlignedMultimodalBatch:
                 and (activity_ratios <= 1.0).all()
             ):
                 raise ValueError("speech_activity_ratios must be finite in [0, 1].")
+            if activity_observed is None:
+                activity_observed = torch.tensor(
+                    [record.speech_source is not None for record in self.records],
+                    dtype=torch.bool,
+                )
+                object.__setattr__(
+                    self,
+                    "speech_activity_observed",
+                    activity_observed,
+                )
+            if (
+                activity_observed.dtype != torch.bool
+                or tuple(activity_observed.shape) != (batch_size,)
+            ):
+                raise ValueError(
+                    "speech_activity_observed must be bool with shape [B]."
+                )
+            _require_cpu(activity_observed, name="speech_activity_observed")
+            source_present = torch.tensor(
+                [record.speech_source is not None for record in self.records],
+                dtype=torch.bool,
+            )
+            if bool((activity_observed & ~source_present).any()):
+                raise ValueError(
+                    "speech activity can be observed only for a real source."
+                )
+        elif activity_observed is not None:
+            raise ValueError(
+                "speech_activity_observed requires speech_activity_ratios."
+            )
 
     def pin_memory(self) -> AlignedMultimodalBatch:
         """Return an equivalent logical batch in page-locked CPU memory.
@@ -670,6 +704,11 @@ class AlignedMultimodalBatch:
                 None
                 if self.speech_activity_ratios is None
                 else self.speech_activity_ratios.pin_memory()
+            ),
+            speech_activity_observed=(
+                None
+                if self.speech_activity_observed is None
+                else self.speech_activity_observed.pin_memory()
             ),
         )
 
@@ -962,6 +1001,17 @@ def collate_aligned_multimodal_samples(
     has_activity_diagnostics = any(
         sample.speech_activity_ratio is not None for sample in sample_tuple
     )
+    speech_activity_observed = (
+        torch.tensor(
+            [
+                sample.speech_activity_ratio is not None
+                for sample in sample_tuple
+            ],
+            dtype=torch.bool,
+        )
+        if has_activity_diagnostics
+        else None
+    )
     speech_activity_ratios = (
         torch.tensor(
             [
@@ -1009,4 +1059,5 @@ def collate_aligned_multimodal_samples(
         speech=speech,
         physiology=physiology,
         speech_activity_ratios=speech_activity_ratios,
+        speech_activity_observed=speech_activity_observed,
     )

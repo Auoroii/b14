@@ -10,7 +10,30 @@ from transformers import WavLMConfig, WavLMModel
 from transformers.modeling_outputs import Wav2Vec2BaseModelOutput
 
 from emotion_model.common import apply_query_mask
-from emotion_model.speech import WavLMEncoder
+from emotion_model.speech import EmotionLayerAggregation, WavLMEncoder
+
+
+def test_learnable_emotion_layer_weights_receive_finite_gradients() -> None:
+    """Let H9--H12 selection adapt through four softmax logits."""
+
+    aggregation = EmotionLayerAggregation("learnable_weighted")
+    hidden_states = tuple(
+        torch.full((2, 3, 4), float(layer_index + 1))
+        for layer_index in range(12)
+    )
+
+    output = aggregation(hidden_states)
+    output.sum().backward()
+
+    logits = aggregation.emotion_layer_logits
+    assert logits is not None
+    assert logits.grad is not None
+    assert bool(torch.isfinite(logits.grad).all())
+    assert bool(torch.count_nonzero(logits.grad))
+    assert torch.allclose(
+        aggregation.normalized_weights(),
+        torch.full((4,), 0.25),
+    )
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:Support for mismatched key_padding_mask and attn_mask is deprecated.*:UserWarning"
@@ -398,6 +421,7 @@ def test_frozen_wavlm_stays_eval_and_is_deterministic_in_wrapper_train_mode() ->
     ("unfreeze_last_n_layers", "expected_indices"),
     [
         (0, ()),
+        (1, (11,)),
         (2, (10, 11)),
         (4, (8, 9, 10, 11)),
     ],

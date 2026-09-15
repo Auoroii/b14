@@ -1,15 +1,15 @@
-"""Train, select, record, and test one dyad-independent K-EmoCon fold."""
+"""Train one or all repeated dyad-independent K-EmoCon folds."""
 
 # ruff: noqa: E402
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import random
 import sys
 import traceback
-from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
@@ -50,6 +50,7 @@ from emotion_model.experiments import (
     ModalityAblationMode,
     append_jsonl_artifact,
     build_ablation_evaluation_summary,
+    build_cross_fold_evaluation_summary,
     build_configured_kemocon_split,
     build_environment_summary,
     build_evaluation_summary,
@@ -59,7 +60,9 @@ from emotion_model.experiments import (
     build_kemocon_model,
     build_kemocon_objective,
     build_kemocon_optimizer,
+    build_bounded_multitask_participant_sampling_weights,
     build_model_parameter_summary,
+    build_runtime_availability_audit,
     build_split_summary,
     emotion_metrics_summary,
     fit_kemocon_train_normalizer,
@@ -237,7 +240,16 @@ def _configure_overfit_diagnostic(
             lr_scheduler_enabled=False,
             speech_modality_dropout=0.0,
             physiology_modality_dropout=0.0,
-            participant_balanced_sampling=False,
+            sampling_policy="uniform",
+            arousal_low_sampling_mass=(
+                config.training.arousal_low_sampling_mass
+            ),
+            valence_low_sampling_mass=(
+                config.training.valence_low_sampling_mass
+            ),
+            max_sampling_weight_ratio=(
+                config.training.max_sampling_weight_ratio
+            ),
             threshold_calibration_enabled=False,
             evaluate_ablation=False,
         ),
@@ -276,8 +288,15 @@ def _overfit_config_overrides(
             "physiology_modality_dropout": (
                 config.training.physiology_modality_dropout
             ),
-            "participant_balanced_sampling": (
-                config.training.participant_balanced_sampling
+            "sampling_policy": config.training.sampling_policy,
+            "arousal_low_sampling_mass": (
+                config.training.arousal_low_sampling_mass
+            ),
+            "valence_low_sampling_mass": (
+                config.training.valence_low_sampling_mass
+            ),
+            "max_sampling_weight_ratio": (
+                config.training.max_sampling_weight_ratio
             ),
             "threshold_calibration_enabled": (
                 config.training.threshold_calibration_enabled
@@ -552,24 +571,27 @@ def _loader(
     pin_memory: bool,
     shuffle: bool,
     seed: int,
-    participant_ids: Sequence[str] | None = None,
+    sample_weights: torch.Tensor | None = None,
 ) -> DataLoader[AlignedMultimodalBatch]:
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed)
     sampler: WeightedRandomSampler | None = None
-    if participant_ids is not None:
-        if len(participant_ids) == 0:
-            raise ValueError("participant_ids must be non-empty when provided.")
-        counts = Counter(participant_ids)
-        weights = torch.tensor(
-            [1.0 / counts[participant_id] for participant_id in participant_ids],
-            dtype=torch.float64,
-        )
+    if sample_weights is not None:
+        if (
+            sample_weights.dtype != torch.float64
+            or sample_weights.device.type != "cpu"
+            or tuple(sample_weights.shape) != (len(cast(Dataset[object], dataset)),)
+            or not bool(torch.isfinite(sample_weights).all())
+            or not bool((sample_weights > 0.0).all())
+        ):
+            raise ValueError(
+                "sample_weights must be positive finite float64 CPU [N]."
+            )
         sampler_generator = torch.Generator(device="cpu")
         sampler_generator.manual_seed(seed + 1_000_000)
         sampler = WeightedRandomSampler(
-            weights,
-            num_samples=len(participant_ids),
+            sample_weights,
+            num_samples=sample_weights.numel(),
             replacement=True,
             generator=sampler_generator,
         )
@@ -585,6 +607,25 @@ def _loader(
         worker_init_fn=_seed_worker,
         generator=generator,
     )
+
+
+def _audit_dataset_runtime_availability(
+    dataset: Dataset[AlignedMultimodalSample],
+    *,
+    description: str,
+) -> dict[str, object]:
+    """Load each sample once and return its declaration/runtime audit."""
+
+    indices = tqdm(
+        range(len(dataset)),
+        total=len(dataset),
+        desc=description,
+        unit="sample",
+        dynamic_ncols=True,
+        leave=False,
+        mininterval=0.25,
+    )
+    return build_runtime_availability_audit(dataset[index] for index in indices)
 
 
 def _progress(
@@ -1038,6 +1079,52 @@ def _run(
         normalizer=normalizer,
         modality_mode=config.training.modality_mode,
     )
+    validation_dataset = build_kemocon_dataset(
+        partitioned.validation_records,
+        manifest.channel_specs,
+        data_root=data_root,
+        config=config.dataset,
+        normalizer=normalizer,
+        modality_mode=config.training.modality_mode,
+    )
+    test_dataset = build_kemocon_dataset(
+        partitioned.test_records,
+        manifest.channel_specs,
+        data_root=data_root,
+        config=config.dataset,
+        normalizer=normalizer,
+        modality_mode=config.training.modality_mode,
+    )
+    logger.emit("Auditing declared versus runtime modality availability...")
+    runtime_audit = {
+        "train": _audit_dataset_runtime_availability(
+            train_dataset,
+            description=f"Fold {fold_index} train availability audit",
+        ),
+        "validation": _audit_dataset_runtime_availability(
+            validation_dataset,
+            description=f"Fold {fold_index} validation availability audit",
+        ),
+        "test": _audit_dataset_runtime_availability(
+            test_dataset,
+            description=f"Fold {fold_index} test availability audit",
+        ),
+    }
+    split_summary["runtime_modality_availability_audit"] = runtime_audit
+    write_json_artifact(fold_directory / "split_summary.json", split_summary)
+    for partition_name, audit in runtime_audit.items():
+        physiology = cast(
+            dict[str, int],
+            cast(dict[str, object], audit["modality_counts"])["physiology"],
+        )
+        logger.emit(
+            "Availability audit | "
+            f"partition={partition_name} records={audit['record_count']} "
+            f"physiology_declared={physiology['declared_count']} "
+            f"physiology_runtime={physiology['runtime_available_count']} "
+            "physiology_declared_but_unavailable="
+            f"{physiology['declared_but_runtime_unavailable_count']}"
+        )
     overfit_samples: tuple[AlignedMultimodalSample, ...] | None = None
     overfit_selection: _OverfitSelectionDiagnostics | None = None
     if overfit_sample_count is not None:
@@ -1064,17 +1151,51 @@ def _run(
             f"quadrants={overfit_selection['quadrant_counts']}"
         )
     else:
-        validation_dataset = build_kemocon_dataset(
-            partitioned.validation_records,
-            manifest.channel_specs,
-            data_root=data_root,
-            config=config.dataset,
-            normalizer=normalizer,
-            modality_mode=config.training.modality_mode,
-        )
         training_data = train_dataset
         validation_data = validation_dataset
         effective_train_records = partitioned.train_records
+    training_sample_weights = (
+        build_bounded_multitask_participant_sampling_weights(
+            effective_train_records,
+            protocol=config.dataset.label_protocol,
+            arousal_low_class_mass=(
+                config.training.arousal_low_sampling_mass
+            ),
+            valence_low_class_mass=config.training.valence_low_sampling_mass,
+            max_weight_ratio=config.training.max_sampling_weight_ratio,
+        )
+        if config.training.sampling_policy
+        == "bounded_multitask_participant_balanced"
+        else None
+    )
+    split_summary["sampling_policy"] = config.training.sampling_policy
+    split_summary["sampling_weight_summary"] = (
+        None
+        if training_sample_weights is None
+        else {
+            "count": training_sample_weights.numel(),
+            "sum": float(training_sample_weights.sum().item()),
+            "minimum": float(training_sample_weights.min().item()),
+            "maximum": float(training_sample_weights.max().item()),
+            "effective_sample_size": float(
+                1.0 / training_sample_weights.square().sum().item()
+            ),
+            "target_arousal_class_mass": {
+                "low": config.training.arousal_low_sampling_mass,
+                "high": 1.0 - config.training.arousal_low_sampling_mass,
+            },
+            "target_valence_class_mass": {
+                "low": config.training.valence_low_sampling_mass,
+                "high": 1.0 - config.training.valence_low_sampling_mass,
+            },
+            "maximum_weight_ratio": config.training.max_sampling_weight_ratio,
+            "actual_weight_ratio": float(
+                training_sample_weights.max().item()
+                / training_sample_weights.min().item()
+            ),
+            "participant_policy": "task_class_aware_initialization",
+        }
+    )
     train_loader = _loader(
         training_data,
         batch_size=config.training.batch_size,
@@ -1082,14 +1203,7 @@ def _run(
         pin_memory=config.training.pin_memory and device.type == "cuda",
         shuffle=True,
         seed=config.training.seed + fold_index,
-        participant_ids=(
-            tuple(
-                record.participant_id
-                for record in effective_train_records
-            )
-            if config.training.participant_balanced_sampling
-            else None
-        ),
+        sample_weights=training_sample_weights,
     )
     validation_loader = _loader(
         validation_data,
@@ -1134,16 +1248,12 @@ def _run(
         effective_train_records,
         protocol=config.dataset.label_protocol,
         device=device,
-        participant_balanced=(
-            config.training.participant_balanced_sampling
-        ),
+        participant_balanced=True,
         class_weight_power=config.loss.class_weight_power,
     )
     split_summary["class_weights"] = _class_weight_payload(class_weights)
     split_summary["class_weighting_policy"] = (
         "participant_balanced_inverse_frequency"
-        if config.training.participant_balanced_sampling
-        else "window_inverse_frequency"
     )
     split_summary["class_weight_power"] = config.loss.class_weight_power
     split_summary["trainable_parameter_count"] = sum(
@@ -1297,8 +1407,11 @@ def _run(
         f"class_weight_power={config.loss.class_weight_power:.2f} "
         f"threshold_calibration="
         f"{config.training.threshold_calibration_enabled} "
-        f"participant_balanced_sampling="
-        f"{config.training.participant_balanced_sampling}"
+        f"sampling_policy={config.training.sampling_policy} "
+        f"arousal_low_sampling_mass="
+        f"{config.training.arousal_low_sampling_mass:.2f} "
+        f"valence_low_sampling_mass="
+        f"{config.training.valence_low_sampling_mass:.2f}"
     )
     if overfit_sample_count is not None:
         logger.emit(
@@ -1759,8 +1872,15 @@ def _run(
         "speech_modality_dropout": (
             config.training.speech_modality_dropout
         ),
-        "participant_balanced_sampling": (
-            config.training.participant_balanced_sampling
+        "sampling_policy": config.training.sampling_policy,
+        "arousal_low_sampling_mass": (
+            config.training.arousal_low_sampling_mass
+        ),
+        "valence_low_sampling_mass": (
+            config.training.valence_low_sampling_mass
+        ),
+        "max_sampling_weight_ratio": (
+            config.training.max_sampling_weight_ratio
         ),
         "history": (
             config.paths.output_dir / f"fold_{fold_index}" / "history.jsonl"
@@ -1988,14 +2108,6 @@ def _run(
             f"{fold_directory.relative_to(_PROJECT_ROOT)}"
         )
         return
-    test_dataset = build_kemocon_dataset(
-        partitioned.test_records,
-        manifest.channel_specs,
-        data_root=data_root,
-        config=config.dataset,
-        normalizer=normalizer,
-        modality_mode=config.training.modality_mode,
-    )
     test_loader = _loader(
         test_dataset,
         batch_size=config.training.batch_size,
@@ -2145,55 +2257,19 @@ def _run(
     logger.emit(f"Complete | artifacts={fold_directory.relative_to(_PROJECT_ROOT)}")
 
 
-def main() -> None:
-    """Run training with progress, structured records, selection, and testing."""
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--config",
-        type=_relative_cli_path,
-        default=Path("configs/kemocon_v4_2_full_window_relation_differential.yaml"),
-    )
-    parser.add_argument("--fold", type=int)
-    parser.add_argument("--resume", type=_relative_cli_path)
-    parser.add_argument(
-        "--overfit-samples",
-        type=_overfit_sample_count,
-        help=(
-            "cache a four-quadrant-balanced multimodal training subset and "
-            "evaluate on identical samples"
-        ),
-    )
-    parser.add_argument(
-        "--overfit-epochs",
-        type=_positive_epoch_count,
-        default=_OVERFIT_DEFAULT_EPOCHS,
-        help="diagnostic epochs used with --overfit-samples (default: 200)",
-    )
-    arguments = parser.parse_args()
-    if arguments.overfit_samples is not None and arguments.resume is not None:
-        parser.error("--overfit-samples cannot be combined with --resume.")
-    config = load_kemocon_experiment_config(
-        resolve_project_relative(_PROJECT_ROOT, arguments.config)
-    )
-    if arguments.overfit_samples is not None:
-        config = _configure_overfit_diagnostic(
-            config,
-            sample_count=arguments.overfit_samples,
-            epochs=arguments.overfit_epochs,
-            modality_mode=KEmoConModalityMode.MULTIMODAL,
-        )
-    fold_index = (
-        config.split.fold_index if arguments.fold is None else arguments.fold
-    )
-    if not 0 <= fold_index < config.split.run_count:
-        raise ValueError("fold index lies outside configured runs.")
+def _execute_fold(
+    *,
+    arguments: argparse.Namespace,
+    config: KEmoConExperimentConfig,
+    fold_index: int,
+    device: torch.device,
+) -> None:
+    """Execute one fold with deterministic state independent of run order."""
 
     torch.manual_seed(config.training.seed)
     random.seed(config.training.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(config.training.seed)
-    device = _device(config.training.device)
     fold_relative = config.paths.output_dir / f"fold_{fold_index}"
     fold_directory = resolve_project_relative(_PROJECT_ROOT, fold_relative)
     fold_directory.mkdir(parents=True, exist_ok=True)
@@ -2244,6 +2320,147 @@ def main() -> None:
         raise
     finally:
         logger.close()
+
+
+def _write_cross_fold_summary(
+    config: KEmoConExperimentConfig,
+    fold_indices: Sequence[int],
+) -> None:
+    """Aggregate completed fold metrics and retain availability audits."""
+
+    output_directory = resolve_project_relative(_PROJECT_ROOT, config.paths.output_dir)
+    evaluations: list[Mapping[str, object]] = []
+    availability_audits: list[dict[str, object]] = []
+    assigned_test_participants: list[str] = []
+    all_split_participants: set[str] = set()
+    for fold_index in fold_indices:
+        fold_directory = output_directory / f"fold_{fold_index}"
+        with (fold_directory / "test_metrics.json").open(encoding="utf-8") as stream:
+            evaluation = json.load(stream)
+        if not isinstance(evaluation, dict):
+            raise TypeError("test_metrics.json must contain a JSON object.")
+        evaluations.append(evaluation)
+        with (fold_directory / "split_summary.json").open(encoding="utf-8") as stream:
+            split_summary = json.load(stream)
+        if not isinstance(split_summary, dict):
+            raise TypeError("split_summary.json must contain a JSON object.")
+        partitions = split_summary.get("partitions")
+        if not isinstance(partitions, dict):
+            raise TypeError("split_summary.json must contain partition mappings.")
+        for partition_name in ("train", "validation", "test"):
+            partition = partitions.get(partition_name)
+            if not isinstance(partition, dict):
+                raise TypeError("every split partition must be a JSON object.")
+            participant_ids = partition.get("participant_ids")
+            if not isinstance(participant_ids, list) or not all(
+                isinstance(value, str) for value in participant_ids
+            ):
+                raise TypeError("split participant_ids must be a list of strings.")
+            all_split_participants.update(cast(list[str], participant_ids))
+            if partition_name == "test":
+                overlap = set(assigned_test_participants) & set(participant_ids)
+                if overlap:
+                    raise ValueError(
+                        "test participants are assigned to multiple folds: "
+                        f"{sorted(overlap)}."
+                    )
+                assigned_test_participants.extend(cast(list[str], participant_ids))
+        availability_audits.append(
+            {
+                "fold_index": fold_index,
+                "partitions": split_summary.get(
+                    "runtime_modality_availability_audit",
+                    {},
+                ),
+            }
+        )
+    summary = build_cross_fold_evaluation_summary(evaluations)
+    summary["split_strategy"] = config.split.strategy
+    summary["split_seed"] = config.split.seed
+    complete_coverage = (
+        set(assigned_test_participants) == all_split_participants
+        and len(assigned_test_participants) == len(all_split_participants)
+    )
+    summary["split_coverage"] = {
+        "participant_count": len(all_split_participants),
+        "test_assignment_count": len(assigned_test_participants),
+        "each_participant_tested_once": complete_coverage,
+        "assigned_test_participant_ids": assigned_test_participants,
+    }
+    if not complete_coverage:
+        raise ValueError("completed folds do not test every split participant once.")
+    summary["runtime_modality_availability_audits"] = availability_audits
+    write_json_artifact(output_directory / "cross_fold_summary.json", summary)
+
+
+def main() -> None:
+    """Run one fold or the complete repeated dyad-safe experiment."""
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config",
+        type=_relative_cli_path,
+        default=Path("configs/kemocon_v4_2_full_window_relation_differential.yaml"),
+    )
+    fold_group = parser.add_mutually_exclusive_group()
+    fold_group.add_argument("--fold", type=int)
+    fold_group.add_argument(
+        "--all-folds",
+        action="store_true",
+        help="run every configured rotating fold and write cross_fold_summary.json",
+    )
+    parser.add_argument("--resume", type=_relative_cli_path)
+    parser.add_argument(
+        "--overfit-samples",
+        type=_overfit_sample_count,
+        help=(
+            "cache a four-quadrant-balanced multimodal training subset and "
+            "evaluate on identical samples"
+        ),
+    )
+    parser.add_argument(
+        "--overfit-epochs",
+        type=_positive_epoch_count,
+        default=_OVERFIT_DEFAULT_EPOCHS,
+        help="diagnostic epochs used with --overfit-samples (default: 200)",
+    )
+    arguments = parser.parse_args()
+    if arguments.overfit_samples is not None and arguments.resume is not None:
+        parser.error("--overfit-samples cannot be combined with --resume.")
+    if arguments.all_folds and arguments.resume is not None:
+        parser.error("--all-folds cannot be combined with --resume.")
+    if arguments.all_folds and arguments.overfit_samples is not None:
+        parser.error("--all-folds cannot be combined with --overfit-samples.")
+    config = load_kemocon_experiment_config(
+        resolve_project_relative(_PROJECT_ROOT, arguments.config)
+    )
+    if arguments.overfit_samples is not None:
+        config = _configure_overfit_diagnostic(
+            config,
+            sample_count=arguments.overfit_samples,
+            epochs=arguments.overfit_epochs,
+            modality_mode=KEmoConModalityMode.MULTIMODAL,
+        )
+    selected_fold = (
+        config.split.fold_index if arguments.fold is None else arguments.fold
+    )
+    fold_indices = (
+        tuple(range(config.split.run_count))
+        if arguments.all_folds
+        else (selected_fold,)
+    )
+    if any(not 0 <= fold_index < config.split.run_count for fold_index in fold_indices):
+        raise ValueError("fold index lies outside configured runs.")
+    device = _device(config.training.device)
+    for fold_index in fold_indices:
+        _execute_fold(
+            arguments=arguments,
+            config=config,
+            fold_index=fold_index,
+            device=device,
+        )
+    if arguments.all_folds:
+        _write_cross_fold_summary(config, fold_indices)
 
 
 if __name__ == "__main__":

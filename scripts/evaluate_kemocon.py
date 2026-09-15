@@ -185,7 +185,7 @@ def main() -> None:
         protocol=config.dataset.label_protocol,
         device=device,
         participant_balanced=(
-            config.training.participant_balanced_sampling
+            config.training.sampling_policy != "uniform"
         ),
         class_weight_power=config.loss.class_weight_power,
     )
@@ -276,6 +276,14 @@ def main() -> None:
     valence = overall["valence"]
     if not isinstance(arousal, dict) or not isinstance(valence, dict):
         raise RuntimeError("evaluation task summaries are invalid.")
+    activity_strata = summary["speech_activity_stratified"]
+    if not isinstance(activity_strata, dict):
+        raise RuntimeError("speech activity stratified summary is invalid.")
+    activity_strata_line = "Speech activity strata | " + " ".join(
+        f"{name}={value['record_count']}"
+        for name, value in activity_strata.items()
+        if isinstance(value, dict)
+    )
     ablation_lines: list[str] = []
     saved_paths = [str(metrics_path.relative_to(_PROJECT_ROOT))]
     if evaluate_ablation:
@@ -362,6 +370,7 @@ def main() -> None:
         f"Thresholds | arousal_high="
         f"{binary_thresholds.arousal_high:.2f} "
         f"valence_high={binary_thresholds.valence_high:.2f}\n"
+        f"{activity_strata_line}\n"
         f"{speech_statistics_line}"
         f"{chr(10).join(ablation_lines)}\n"
         f"Saved | {', '.join(saved_paths)}"
