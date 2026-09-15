@@ -235,12 +235,16 @@ def test_builder_selects_new_backend_without_changing_full_window_speech() -> No
     assert config.training.physiology_modality_dropout == pytest.approx(0.1)
     assert (
         config.training.sampling_policy
-        == "bounded_multitask_participant_balanced"
+        == "soft_valence_class_participant_balanced"
     )
-    assert config.training.arousal_low_sampling_mass == pytest.approx(0.35)
     assert config.training.valence_low_sampling_mass == pytest.approx(0.35)
-    assert config.training.max_sampling_weight_ratio == pytest.approx(20.0)
+    assert (
+        config.training.checkpoint_selection_metric
+        == "calibrated_participant_mean_macro_f1"
+    )
+    assert config.training.batch_size == 80
     assert config.training.threshold_calibration_enabled
+    assert config.training.threshold_calibration_shrinkage == pytest.approx(0.5)
     assert config.loss.speech_aux_weight == pytest.approx(0.3)
     assert config.loss.physiology_aux_weight == pytest.approx(0.1)
     assert config.training.evaluate_ablation

@@ -78,7 +78,9 @@ split 以 debate dyad/session 为隔离单位，训练、验证、测试参与�
 
 测试必须启用 same-window modality ablation：只在自然状态下 speech 与 physiology 都可用的测试窗口上分别执行 speech-only 和 physiology-only 推理。该诊断不得参与训练、阈值拟合或 checkpoint 选择。
 
-训练 sampler 必须采用有界的 Arousal/Valence 联合类别—参与者感知权重：两个任务的 Low/High 目标采样质量均为 0.35/0.65，以任务—类别内参与者均衡初始化，并限制最大/最小样本权重比为 20。该策略与 class-weighted cross entropy 配合，避免单任务采样牺牲另一任务或少数窗口过度重复。阈值校准仅使用当前 fold 验证集的 pooled binary macro-F1；不得使用测试标签。
+当前五折对照的训练 sampler 采用柔和的 Valence 类别—参与者均衡权重：Low/High 的期望采样质量分别为 0.35/0.65，同一 Valence 类别内每位参与者等权。该对照与双任务有界 sampler 保持相同模型、split 和损失，用于判断采样策略的真实影响。阈值校准仅使用当前 fold 验证集的 pooled binary macro-F1；不得使用测试标签。
+
+checkpoint 选择使用校准后的 participant Arousal 与 participant Valence Macro-F1 均值，分数严格相同时以更低 validation loss 决胜。当前阈值正则化将验证集网格搜索阈值相对 0.5 的偏移量保留 50%；测试标签不得参与 checkpoint 或阈值选择。当前服务器训练 batch size 为 80，学习率保持 `1e-4`。
 
 ## 9. 训练、评估与 checkpoint
 

@@ -33,7 +33,7 @@ from emotion_model.experiments import (
     build_configured_kemocon_split,
     build_kemocon_class_weights,
     build_kemocon_model,
-    build_bounded_multitask_participant_sampling_weights,
+    build_valence_class_participant_sampling_weights,
     load_kemocon_experiment_config,
 )
 
@@ -463,14 +463,16 @@ def test_participant_balanced_class_weights_equalize_person_mass() -> None:
     assert torch.allclose(weights.valence, torch.ones(2))
 
 
-def test_multitask_sampling_targets_both_tasks_and_bounds_weights() -> None:
-    """Move both binary marginals toward targets without extreme repetition."""
+def test_valence_sampling_softly_balances_classes_then_people() -> None:
+    """Give Valence Low 35% mass and equalize people within each class."""
 
     specifications = (
-        ("ll", "P1", 1.0, 1.0),
-        ("lh", "P2", 1.0, 5.0),
-        ("hl", "P3", 5.0, 1.0),
-        ("hh", "P4", 5.0, 5.0),
+        ("low-p1-a", "P1", 1.0),
+        ("low-p1-b", "P1", 1.0),
+        ("low-p2", "P2", 1.0),
+        ("high-p1", "P1", 5.0),
+        ("high-p3-a", "P3", 5.0),
+        ("high-p3-b", "P3", 5.0),
     )
     records = tuple(
         _record(
@@ -478,30 +480,30 @@ def test_multitask_sampling_targets_both_tasks_and_bounds_weights() -> None:
             participant_id,
             "session",
             float(index),
-            scores=EmotionScores(arousal, valence),
+            scores=EmotionScores(1.0, valence),
         )
-        for index, (sample_id, participant_id, arousal, valence) in enumerate(
-            specifications
-        )
+        for index, (sample_id, participant_id, valence) in enumerate(specifications)
     )
 
-    weights = build_bounded_multitask_participant_sampling_weights(
+    weights = build_valence_class_participant_sampling_weights(
         records,
         protocol=LabelProtocol.OFFICIAL_MID_HIGH,
-        arousal_low_class_mass=0.35,
-        valence_low_class_mass=0.35,
-        max_weight_ratio=20.0,
+        low_class_mass=0.35,
     )
 
     assert weights.dtype == torch.float64
     assert torch.isclose(weights.sum(), torch.tensor(1.0, dtype=torch.float64))
-    assert torch.isclose(weights[:2].sum(), torch.tensor(0.35, dtype=torch.float64))
-    assert torch.isclose(weights[[0, 2]].sum(), torch.tensor(0.35, dtype=torch.float64))
-    assert float(weights.max() / weights.min()) <= 20.0
+    assert torch.allclose(
+        weights,
+        torch.tensor(
+            [0.0875, 0.0875, 0.175, 0.325, 0.1625, 0.1625],
+            dtype=torch.float64,
+        ),
+    )
 
 
 @pytest.mark.parametrize("low_class_mass", [0.0, 0.5, 1.0])
-def test_multitask_sampling_rejects_non_soft_class_mass(
+def test_valence_sampling_rejects_non_soft_class_mass(
     low_class_mass: float,
 ) -> None:
     """Reject absent, exact, or reversed minority balancing."""
@@ -524,12 +526,10 @@ def test_multitask_sampling_rejects_non_soft_class_mass(
     )
 
     with pytest.raises(ValueError, match="strictly between 0 and 0.5"):
-        build_bounded_multitask_participant_sampling_weights(
+        build_valence_class_participant_sampling_weights(
             records,
             protocol=LabelProtocol.OFFICIAL_MID_HIGH,
-            arousal_low_class_mass=low_class_mass,
-            valence_low_class_mass=0.35,
-            max_weight_ratio=20.0,
+            low_class_mass=low_class_mass,
         )
 
 

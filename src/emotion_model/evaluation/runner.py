@@ -885,6 +885,7 @@ def evaluate_participant_independent(
     class_weights: EmotionTaskClassWeights | None = None,
     binary_thresholds: BinaryDecisionThresholds | None = None,
     calibrate_thresholds: bool = False,
+    threshold_calibration_shrinkage: float = 1.0,
 ) -> ParticipantIndependentEvaluationOutput:
     """Evaluate one participant partition with one forward per batch.
 
@@ -899,7 +900,9 @@ def evaluate_participant_independent(
             fits or changes them.
         binary_thresholds: Optional preselected arousal/valence thresholds.
         calibrate_thresholds: Whether to select thresholds from this validation
-            partition using equal-participant macro-F1.
+            partition using pooled macro-F1.
+        threshold_calibration_shrinkage: Fraction in ``[0,1]`` of the searched
+            thresholds' displacement from 0.5 to retain.
 
     Returns:
         :class:`ParticipantIndependentEvaluationOutput` containing validation
@@ -923,6 +926,21 @@ def evaluate_participant_independent(
     _validate_runner_inputs(model, objective, batches, scope)
     if not isinstance(calibrate_thresholds, bool):
         raise TypeError("calibrate_thresholds must be bool.")
+    if isinstance(threshold_calibration_shrinkage, bool) or not isinstance(
+        threshold_calibration_shrinkage,
+        (int, float),
+    ):
+        raise TypeError(
+            "threshold_calibration_shrinkage must be a real number, not bool."
+        )
+    resolved_threshold_shrinkage = float(threshold_calibration_shrinkage)
+    if (
+        not math.isfinite(resolved_threshold_shrinkage)
+        or not 0.0 <= resolved_threshold_shrinkage <= 1.0
+    ):
+        raise ValueError(
+            "threshold_calibration_shrinkage must lie in [0, 1]."
+        )
     if binary_thresholds is not None and not isinstance(
         binary_thresholds,
         BinaryDecisionThresholds,
@@ -1218,6 +1236,7 @@ def evaluate_participant_independent(
             participant_ids=tuple(participant_ids),
             sample_valid=combined_sample_valid,
             ignore_index=ignore_index,
+            shrinkage=resolved_threshold_shrinkage,
         )
     else:
         resolved_thresholds = (

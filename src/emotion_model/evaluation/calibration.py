@@ -26,6 +26,15 @@ def _probability(value: float, *, name: str) -> float:
     return result
 
 
+def _unit_interval(value: float, *, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be a real number, not bool.")
+    result = float(value)
+    if not math.isfinite(result) or not 0.0 <= result <= 1.0:
+        raise ValueError(f"{name} must lie in [0, 1].")
+    return result
+
+
 @dataclass(frozen=True)
 class BinaryDecisionThresholds:
     """High-class probability thresholds for arousal and valence.
@@ -225,25 +234,38 @@ def calibrate_binary_decision_thresholds(
     participant_ids: Sequence[str],
     sample_valid: Tensor,
     ignore_index: int,
+    shrinkage: float = 1.0,
 ) -> BinaryDecisionThresholds:
-    """Select independent validation thresholds from CPU vectors ``[N]``."""
+    """Select and regularize validation thresholds from CPU vectors ``[N]``.
+
+    ``shrinkage`` retains that fraction of each grid-selected threshold's
+    displacement from 0.5. Thus ``1.0`` preserves the searched threshold,
+    ``0.5`` moves it halfway toward 0.5, and ``0.0`` uses 0.5 exactly.
+    """
+
+    resolved_shrinkage = _unit_interval(shrinkage, name="shrinkage")
+    raw_arousal = select_pooled_macro_f1_threshold(
+        arousal_high_probabilities,
+        arousal_targets,
+        participant_ids,
+        sample_valid,
+        ignore_index=ignore_index,
+    )
+    raw_valence = select_pooled_macro_f1_threshold(
+        valence_high_probabilities,
+        valence_targets,
+        participant_ids,
+        sample_valid,
+        ignore_index=ignore_index,
+    )
 
     return BinaryDecisionThresholds(
-        arousal_high=select_pooled_macro_f1_threshold(
-            arousal_high_probabilities,
-            arousal_targets,
-            participant_ids,
-            sample_valid,
-            ignore_index=ignore_index,
+        arousal_high=0.5 + resolved_shrinkage * (raw_arousal - 0.5),
+        valence_high=0.5 + resolved_shrinkage * (raw_valence - 0.5),
+        policy=(
+            f"{_CALIBRATION_POLICY}_center_retention_"
+            f"{resolved_shrinkage:g}"
         ),
-        valence_high=select_pooled_macro_f1_threshold(
-            valence_high_probabilities,
-            valence_targets,
-            participant_ids,
-            sample_valid,
-            ignore_index=ignore_index,
-        ),
-        policy=_CALIBRATION_POLICY,
     )
 
 

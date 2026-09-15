@@ -49,7 +49,7 @@ python -m pytest -q
 
 默认 manifest：`artifacts/kemocon/manifest_self.json`
 
-默认实验目录：`runs/kemocon_v4_2_full_window_relation_differential_seed2026/`
+默认实验目录：`runs/kemocon_v4_2_soft_valence_threshold_shrink05_batch80_cv_seed2026/`
 
 每个 fold 写入 `fold_<index>/`，主要文件包括：
 
@@ -63,9 +63,11 @@ python -m pytest -q
 
 完整重复实验使用 5-fold label-stratified、dyad-safe rotating splits。每个参与者恰好作为测试参与者一次；全部 fold 完成后写入 `cross_fold_summary.json`，其中包含 fold 均值、总体标准差、逐 fold 指标和各 fold 的运行时模态可用性审计。`split_summary.json` 同时保留 manifest 声明数量与实际加载后的 speech/physiology 可用数量、按参与者差异、按 physiology 通道差异及 mismatch sample ID。
 
-训练采样采用 `bounded_multitask_participant_balanced`：Arousal 与 Valence 的 Low/High 目标采样质量均为 0.35/0.65，以任务—类别内参与者均衡作为初始化，再联合校准两个任务的边际质量；单样本最大/最小权重比限制为 20，避免极少数窗口被反复抽取。验证阈值按 pooled binary macro-F1 选择，Low 与 High F1 等权。
+当前五折对照采用 `soft_valence_class_participant_balanced`：Valence Low/High 的期望采样质量分别为 0.35/0.65，并在每个类别内部对参与者等权。该设置与双任务有界 sampler 使用完全相同的模型、split 和损失，用于隔离采样策略的真实跨参与者影响。验证阈值按 pooled binary macro-F1 选择，Low 与 High F1 等权。
 
-当前单变量采样实验保持 speech auxiliary loss 权重为 0.3、physiology auxiliary loss 为 0.1，仅把采样策略改为双任务有界采样。测试启用 same-window modality ablation，在原本 speech 与 physiology 都可用的同一组窗口上分别屏蔽一种模态，用于判断语音独立判别能力，ablation 不参与训练或 checkpoint 选择。
+当前 checkpoint 选择恢复为校准后的 participant Arousal/Valence Macro-F1 均值，同分时选择 validation loss 更低的 epoch。验证集网格搜索得到的每个阈值只保留其相对 0.5 偏移量的 50%，即 `0.5 + 0.5 * (searched_threshold - 0.5)`，用于降低小验证集阈值过拟合。训练 batch size 提升为 80 以缩短运行时间，学习率保持 `1e-4`；这会减少每个 epoch 的优化器步数，因此应作为新的五折实验设置单独比较。
+
+当前五折采样对照保持 speech auxiliary loss 权重为 0.3、physiology auxiliary loss 为 0.1，其余训练变量不变。测试启用 same-window modality ablation，在原本 speech 与 physiology 都可用的同一组窗口上分别屏蔽一种模态，用于判断语音独立判别能力，ablation 不参与训练或 checkpoint 选择。
 
 ## 关键约束
 

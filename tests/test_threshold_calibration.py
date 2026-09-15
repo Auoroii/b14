@@ -37,6 +37,51 @@ def test_calibration_finds_independent_pooled_macro_f1_thresholds() -> None:
     assert "validation_pooled_macro_f1" in thresholds.policy
 
 
+def test_calibration_shrinkage_moves_thresholds_toward_half() -> None:
+    """Retain exactly half of each searched displacement from 0.5."""
+
+    arguments = {
+        "arousal_high_probabilities": torch.tensor(
+            [0.60, 0.80, 0.65, 0.90], dtype=torch.float64
+        ),
+        "valence_high_probabilities": torch.tensor(
+            [0.30, 0.45, 0.40, 0.55], dtype=torch.float64
+        ),
+        "arousal_targets": torch.tensor([0, 1, 0, 1], dtype=torch.long),
+        "valence_targets": torch.tensor([0, 1, 0, 1], dtype=torch.long),
+        "participant_ids": ("P1", "P1", "P2", "P2"),
+        "sample_valid": torch.ones(4, dtype=torch.bool),
+        "ignore_index": -100,
+    }
+    raw = calibrate_binary_decision_thresholds(**arguments)
+    shrunk = calibrate_binary_decision_thresholds(**arguments, shrinkage=0.5)
+
+    assert shrunk.arousal_high == pytest.approx(
+        0.5 + 0.5 * (raw.arousal_high - 0.5)
+    )
+    assert shrunk.valence_high == pytest.approx(
+        0.5 + 0.5 * (raw.valence_high - 0.5)
+    )
+    assert "center_retention_0.5" in shrunk.policy
+
+
+@pytest.mark.parametrize("shrinkage", [True, -0.1, 1.1, float("nan")])
+def test_calibration_rejects_invalid_shrinkage(shrinkage: object) -> None:
+    """Reject non-finite, Boolean, and out-of-range shrinkage values."""
+
+    with pytest.raises((TypeError, ValueError)):
+        calibrate_binary_decision_thresholds(
+            arousal_high_probabilities=torch.tensor([0.2, 0.8]),
+            valence_high_probabilities=torch.tensor([0.2, 0.8]),
+            arousal_targets=torch.tensor([0, 1]),
+            valence_targets=torch.tensor([0, 1]),
+            participant_ids=("P1", "P2"),
+            sample_valid=torch.ones(2, dtype=torch.bool),
+            ignore_index=-100,
+            shrinkage=shrinkage,  # type: ignore[arg-type]
+        )
+
+
 def test_threshold_metadata_round_trip_is_exact_and_strict() -> None:
     """Persist finite threshold values without accepting unknown fields."""
 

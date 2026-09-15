@@ -25,8 +25,44 @@ from scripts.train_kemocon import (
     _diagnostic_parameter_group,
     _parameter_update_diagnostics,
     _select_balanced_overfit_samples,
+    _selection_improved,
     _snapshot_trainable_parameters,
+    _validation_selection_value,
 )
+
+
+def test_participant_selection_averages_participant_tasks() -> None:
+    """Average calibrated participant arousal and valence Macro-F1."""
+
+    value = _validation_selection_value(
+        metric_name="calibrated_participant_mean_macro_f1",
+        validation_loss=9.0,
+        arousal_macro_f1=0.8,
+        valence_macro_f1=0.6,
+        participant_arousal_macro_f1=0.4,
+        participant_valence_macro_f1=0.2,
+    )
+
+    assert value == pytest.approx(0.3)
+
+
+def test_participant_selection_uses_validation_loss_only_to_break_ties() -> None:
+    """Prefer higher participant score, then lower loss for an exact tie."""
+
+    assert _selection_improved(
+        metric_name="calibrated_participant_mean_macro_f1",
+        candidate=0.5,
+        best=0.5,
+        candidate_validation_loss=1.2,
+        best_validation_loss=1.3,
+    )
+    assert not _selection_improved(
+        metric_name="calibrated_participant_mean_macro_f1",
+        candidate=0.49,
+        best=0.5,
+        candidate_validation_loss=1.0,
+        best_validation_loss=1.3,
+    )
 
 
 def _sample(
@@ -252,6 +288,7 @@ def test_overfit_configuration_is_isolated_and_disables_regularization() -> None
     assert diagnostic.training.epochs == 123
     assert diagnostic.training.learning_rate == pytest.approx(1.0e-3)
     assert diagnostic.training.weight_decay == 0.0
+    assert diagnostic.training.checkpoint_selection_metric == "validation_loss"
     assert not diagnostic.training.lr_scheduler_enabled
     assert diagnostic.training.speech_modality_dropout == 0.0
     assert diagnostic.training.physiology_modality_dropout == 0.0

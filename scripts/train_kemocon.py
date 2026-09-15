@@ -60,7 +60,7 @@ from emotion_model.experiments import (
     build_kemocon_model,
     build_kemocon_objective,
     build_kemocon_optimizer,
-    build_bounded_multitask_participant_sampling_weights,
+    build_valence_class_participant_sampling_weights,
     build_model_parameter_summary,
     build_runtime_availability_audit,
     build_split_summary,
@@ -241,14 +241,8 @@ def _configure_overfit_diagnostic(
             speech_modality_dropout=0.0,
             physiology_modality_dropout=0.0,
             sampling_policy="uniform",
-            arousal_low_sampling_mass=(
-                config.training.arousal_low_sampling_mass
-            ),
             valence_low_sampling_mass=(
                 config.training.valence_low_sampling_mass
-            ),
-            max_sampling_weight_ratio=(
-                config.training.max_sampling_weight_ratio
             ),
             threshold_calibration_enabled=False,
             evaluate_ablation=False,
@@ -289,17 +283,14 @@ def _overfit_config_overrides(
                 config.training.physiology_modality_dropout
             ),
             "sampling_policy": config.training.sampling_policy,
-            "arousal_low_sampling_mass": (
-                config.training.arousal_low_sampling_mass
-            ),
             "valence_low_sampling_mass": (
                 config.training.valence_low_sampling_mass
             ),
-            "max_sampling_weight_ratio": (
-                config.training.max_sampling_weight_ratio
-            ),
             "threshold_calibration_enabled": (
                 config.training.threshold_calibration_enabled
+            ),
+            "threshold_calibration_shrinkage": (
+                config.training.threshold_calibration_shrinkage
             ),
             "evaluate_ablation": config.training.evaluate_ablation,
         },
@@ -1155,17 +1146,13 @@ def _run(
         validation_data = validation_dataset
         effective_train_records = partitioned.train_records
     training_sample_weights = (
-        build_bounded_multitask_participant_sampling_weights(
+        build_valence_class_participant_sampling_weights(
             effective_train_records,
             protocol=config.dataset.label_protocol,
-            arousal_low_class_mass=(
-                config.training.arousal_low_sampling_mass
-            ),
-            valence_low_class_mass=config.training.valence_low_sampling_mass,
-            max_weight_ratio=config.training.max_sampling_weight_ratio,
+            low_class_mass=config.training.valence_low_sampling_mass,
         )
         if config.training.sampling_policy
-        == "bounded_multitask_participant_balanced"
+        == "soft_valence_class_participant_balanced"
         else None
     )
     split_summary["sampling_policy"] = config.training.sampling_policy
@@ -1180,20 +1167,11 @@ def _run(
             "effective_sample_size": float(
                 1.0 / training_sample_weights.square().sum().item()
             ),
-            "target_arousal_class_mass": {
-                "low": config.training.arousal_low_sampling_mass,
-                "high": 1.0 - config.training.arousal_low_sampling_mass,
-            },
-            "target_valence_class_mass": {
+            "expected_valence_class_mass": {
                 "low": config.training.valence_low_sampling_mass,
                 "high": 1.0 - config.training.valence_low_sampling_mass,
             },
-            "maximum_weight_ratio": config.training.max_sampling_weight_ratio,
-            "actual_weight_ratio": float(
-                training_sample_weights.max().item()
-                / training_sample_weights.min().item()
-            ),
-            "participant_policy": "task_class_aware_initialization",
+            "within_class_participant_mass": "equal",
         }
     )
     train_loader = _loader(
@@ -1339,6 +1317,23 @@ def _run(
                 "resume checkpoint class_weight_power does not match the "
                 "current configuration."
             )
+        metadata_threshold_shrinkage = loaded.extra_metadata.get(
+            "threshold_calibration_shrinkage"
+        )
+        if (
+            isinstance(metadata_threshold_shrinkage, bool)
+            or not isinstance(metadata_threshold_shrinkage, (int, float))
+            or not math.isclose(
+                float(metadata_threshold_shrinkage),
+                config.training.threshold_calibration_shrinkage,
+                rel_tol=0.0,
+                abs_tol=1.0e-12,
+            )
+        ):
+            raise ValueError(
+                "resume checkpoint threshold calibration shrinkage does not "
+                "match the current configuration."
+            )
         metadata_best_selection = loaded.extra_metadata.get(
             "best_selection_value"
         )
@@ -1407,9 +1402,9 @@ def _run(
         f"class_weight_power={config.loss.class_weight_power:.2f} "
         f"threshold_calibration="
         f"{config.training.threshold_calibration_enabled} "
+        f"threshold_shrinkage="
+        f"{config.training.threshold_calibration_shrinkage:.2f} "
         f"sampling_policy={config.training.sampling_policy} "
-        f"arousal_low_sampling_mass="
-        f"{config.training.arousal_low_sampling_mass:.2f} "
         f"valence_low_sampling_mass="
         f"{config.training.valence_low_sampling_mass:.2f}"
     )
@@ -1497,6 +1492,9 @@ def _run(
             calibrate_thresholds=(
                 config.training.threshold_calibration_enabled
             ),
+            threshold_calibration_shrinkage=(
+                config.training.threshold_calibration_shrinkage
+            ),
         )
         validation_epoch = validation_result.loss_epoch
         validation_seconds = perf_counter() - validation_clock
@@ -1579,6 +1577,9 @@ def _run(
                 config.training.checkpoint_selection_metric
             ),
             "class_weight_power": config.loss.class_weight_power,
+            "threshold_calibration_shrinkage": (
+                config.training.threshold_calibration_shrinkage
+            ),
             "binary_decision_thresholds": (
                 validation_result.binary_decision_thresholds.to_metadata()
             ),
@@ -1851,6 +1852,9 @@ def _run(
         "threshold_calibration_enabled": (
             config.training.threshold_calibration_enabled
         ),
+        "threshold_calibration_shrinkage": (
+            config.training.threshold_calibration_shrinkage
+        ),
         "training_modality_mode": config.training.modality_mode.value,
         "binary_decision_thresholds": (
             best_binary_thresholds.to_metadata()
@@ -1873,14 +1877,8 @@ def _run(
             config.training.speech_modality_dropout
         ),
         "sampling_policy": config.training.sampling_policy,
-        "arousal_low_sampling_mass": (
-            config.training.arousal_low_sampling_mass
-        ),
         "valence_low_sampling_mass": (
             config.training.valence_low_sampling_mass
-        ),
-        "max_sampling_weight_ratio": (
-            config.training.max_sampling_weight_ratio
         ),
         "history": (
             config.paths.output_dir / f"fold_{fold_index}" / "history.jsonl"

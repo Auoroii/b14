@@ -164,10 +164,9 @@ class KEmoConTrainingConfig:
     speech_modality_dropout: float
     physiology_modality_dropout: float
     sampling_policy: str
-    arousal_low_sampling_mass: float
     valence_low_sampling_mass: float
-    max_sampling_weight_ratio: float
     threshold_calibration_enabled: bool
+    threshold_calibration_shrinkage: float
     evaluate_ablation: bool
     modality_mode: KEmoConModalityMode
     min_wavlm_learning_rate: float | None = None
@@ -241,10 +240,9 @@ _SECTION_FIELDS: dict[str, frozenset[str]] = {
             "speech_modality_dropout",
             "physiology_modality_dropout",
             "sampling_policy",
-            "arousal_low_sampling_mass",
             "valence_low_sampling_mass",
-            "max_sampling_weight_ratio",
             "threshold_calibration_enabled",
+            "threshold_calibration_shrinkage",
             "evaluate_ablation",
             "modality_mode",
         }
@@ -715,22 +713,19 @@ def load_kemocon_experiment_config(path: str | Path) -> KEmoConExperimentConfig:
                 "physiology_modality_dropout",
             ),
             sampling_policy=_string(training, "sampling_policy"),
-            arousal_low_sampling_mass=_real(
-                training,
-                "arousal_low_sampling_mass",
-            ),
             valence_low_sampling_mass=_real(
                 training,
                 "valence_low_sampling_mass",
-            ),
-            max_sampling_weight_ratio=_real(
-                training,
-                "max_sampling_weight_ratio",
             ),
             threshold_calibration_enabled=(
                 _boolean(training, "threshold_calibration_enabled")
                 if "threshold_calibration_enabled" in training
                 else False
+            ),
+            threshold_calibration_shrinkage=(
+                _real(training, "threshold_calibration_shrinkage")
+                if "threshold_calibration_shrinkage" in training
+                else 1.0
             ),
             evaluate_ablation=(
                 _boolean(training, "evaluate_ablation")
@@ -836,28 +831,16 @@ def _validate_config(config: KEmoConExperimentConfig) -> None:
         raise ValueError("training.num_workers must be non-negative.")
     if config.training.sampling_policy not in {
         "uniform",
-        "bounded_multitask_participant_balanced",
+        "soft_valence_class_participant_balanced",
     }:
         raise ValueError(
             "training.sampling_policy must be "
-            "'bounded_multitask_participant_balanced' or 'uniform'."
-        )
-    if not 0.0 < config.training.arousal_low_sampling_mass < 0.5:
-        raise ValueError(
-            "training.arousal_low_sampling_mass must lie strictly between "
-            "0 and 0.5."
+            "'soft_valence_class_participant_balanced' or 'uniform'."
         )
     if not 0.0 < config.training.valence_low_sampling_mass < 0.5:
         raise ValueError(
             "training.valence_low_sampling_mass must lie strictly between "
             "0 and 0.5."
-        )
-    if (
-        not math.isfinite(config.training.max_sampling_weight_ratio)
-        or config.training.max_sampling_weight_ratio < 1.0
-    ):
-        raise ValueError(
-            "training.max_sampling_weight_ratio must be finite and at least 1."
         )
     if config.training.lr_scheduler_patience < 0:
         raise ValueError("training.lr_scheduler_patience must be non-negative.")
@@ -931,8 +914,12 @@ def _validate_config(config: KEmoConExperimentConfig) -> None:
         and not config.training.threshold_calibration_enabled
     ):
         raise ValueError(
-            "calibrated participant checkpoint selection requires "
+            "calibrated checkpoint selection requires "
             "training.threshold_calibration_enabled=true."
+        )
+    if not 0.0 <= config.training.threshold_calibration_shrinkage <= 1.0:
+        raise ValueError(
+            "training.threshold_calibration_shrinkage must lie in [0, 1]."
         )
     if not 0.0 < config.training.lr_scheduler_factor < 1.0:
         raise ValueError(
@@ -1127,30 +1114,28 @@ def _balanced_binary_weights(
     return weights.to(device=device, dtype=torch.float32)
 
 
-def build_bounded_multitask_participant_sampling_weights(
+def build_valence_class_participant_sampling_weights(
     records: Sequence[MultimodalWindowRecord],
     *,
     protocol: LabelProtocol,
-    arousal_low_class_mass: float,
-    valence_low_class_mass: float,
-    max_weight_ratio: float,
+    low_class_mass: float,
     ignore_index: int = -100,
 ) -> Tensor:
-    """Return bounded Arousal/Valence participant-aware weights ``[N]``.
+    """Return soft Valence-class and participant-balanced weights ``[N]``.
 
     Args:
         records: Ordered training records of logical shape ``[N]``.
         protocol: Binary label protocol used by the training dataset.
-        arousal_low_class_mass: Target sampling mass for Arousal Low.
-        valence_low_class_mass: Target sampling mass for Valence Low.
-        max_weight_ratio: Upper bound on largest/smallest sample weight.
+        low_class_mass: Total expected sampling mass assigned to Valence Low.
+            It must lie strictly between zero and 0.5, leaving the remainder
+            for High and avoiding exact 50/50 oversampling.
         ignore_index: Label sentinel outside the binary classes.
 
     Returns:
-        Positive float64 CPU weights ``[N]`` summing to one. The initialization
-        balances participants within each task/class, iterative scaling moves
-        both task marginals toward their targets, and final clipping bounds
-        extreme repetition. This changes only sampling, never labels or loss.
+        Positive float64 CPU weights ``[N]`` summing to one. Low receives
+        ``low_class_mass`` and High receives the remainder; within a class,
+        every participant containing that class receives equal mass. This
+        changes only sampling, never labels or loss weights.
     """
 
     if isinstance(records, (str, bytes)) or not isinstance(records, Sequence):
@@ -1162,89 +1147,51 @@ def build_bounded_multitask_participant_sampling_weights(
         raise ValueError("records must contain at least one manifest record.")
     if not isinstance(protocol, LabelProtocol):
         raise TypeError("protocol must be LabelProtocol.")
-    target_masses: list[float] = []
-    for name, value in (
-        ("arousal_low_class_mass", arousal_low_class_mass),
-        ("valence_low_class_mass", valence_low_class_mass),
-    ):
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(float(value))
-        ):
-            raise TypeError(f"{name} must be a finite real number, not bool.")
-        normalized = float(value)
-        if not 0.0 < normalized < 0.5:
-            raise ValueError(f"{name} must lie strictly between 0 and 0.5.")
-        target_masses.append(normalized)
     if (
-        isinstance(max_weight_ratio, bool)
-        or not isinstance(max_weight_ratio, (int, float))
-        or not math.isfinite(float(max_weight_ratio))
+        isinstance(low_class_mass, bool)
+        or not isinstance(low_class_mass, (int, float))
+        or not math.isfinite(float(low_class_mass))
     ):
-        raise TypeError("max_weight_ratio must be a finite real number, not bool.")
-    ratio_limit = float(max_weight_ratio)
-    if ratio_limit < 1.0:
-        raise ValueError("max_weight_ratio must be at least 1.")
+        raise TypeError("low_class_mass must be a finite real number, not bool.")
+    low_mass = float(low_class_mass)
+    if not 0.0 < low_mass < 0.5:
+        raise ValueError("low_class_mass must lie strictly between 0 and 0.5.")
     if isinstance(ignore_index, bool) or not isinstance(ignore_index, int):
         raise TypeError("ignore_index must be an integer, not bool.")
-    task_labels: list[Tensor] = []
-    task_initializers: list[Tensor] = []
-    for task_name in ("arousal", "valence"):
-        labels, valid = binarize_emotion_scores(
-            torch.tensor(
-                [getattr(record.emotion_scores, task_name) for record in record_tuple],
-                dtype=torch.float64,
-            ),
-            protocol,
-            ignore_index=ignore_index,
-        )
-        if not bool(valid.all()):
-            raise ValueError(
-                f"multitask sampling requires every record to have valid {task_name}."
-            )
-        participants_by_class: dict[int, set[str]] = {0: set(), 1: set()}
-        stratum_counts: dict[tuple[int, str], int] = {}
-        for record, label_tensor in zip(record_tuple, labels, strict=True):
-            label = int(label_tensor.item())
-            participants_by_class[label].add(record.participant_id)
-            key = (label, record.participant_id)
-            stratum_counts[key] = stratum_counts.get(key, 0) + 1
-        if any(not participants for participants in participants_by_class.values()):
-            raise ValueError(f"training records must contain both {task_name} classes.")
-        initializer = torch.tensor(
-            [
-                0.5
-                / len(participants_by_class[int(label.item())])
-                / stratum_counts[(int(label.item()), record.participant_id)]
-                for record, label in zip(record_tuple, labels, strict=True)
-            ],
+    labels, valid = binarize_emotion_scores(
+        torch.tensor(
+            [record.emotion_scores.valence for record in record_tuple],
             dtype=torch.float64,
+        ),
+        protocol,
+        ignore_index=ignore_index,
+    )
+    if not bool(valid.all()):
+        raise ValueError(
+            "Valence-balanced sampling requires every training record to have "
+            "a valid binary valence label."
         )
-        task_labels.append(labels)
-        task_initializers.append(initializer)
-
-    weights = torch.stack(task_initializers).mean(dim=0)
-    weights /= weights.sum()
-    for _ in range(64):
-        for labels, low_mass in zip(task_labels, target_masses, strict=True):
-            masses = torch.zeros(2, dtype=torch.float64).scatter_add_(
-                0,
-                labels,
-                weights,
-            )
-            desired = torch.tensor([low_mass, 1.0 - low_mass], dtype=torch.float64)
-            weights *= (desired / masses).index_select(0, labels)
-            weights /= weights.sum()
-
-    uniform = 1.0 / len(record_tuple)
-    root_ratio = math.sqrt(ratio_limit)
-    weights = weights.clamp(min=uniform / root_ratio, max=uniform * root_ratio)
-    weights /= weights.sum()
-    if not bool(torch.isfinite(weights).all()) or not bool((weights > 0).all()):
-        raise RuntimeError("sampling weights must be finite and positive.")
-    if float(weights.max() / weights.min()) > ratio_limit + 1.0e-10:
-        raise RuntimeError("sampling weight ratio bound was violated.")
+    participants_by_class: dict[int, set[str]] = {0: set(), 1: set()}
+    stratum_counts: dict[tuple[int, str], int] = {}
+    for record, label_tensor in zip(record_tuple, labels, strict=True):
+        label = int(label_tensor.item())
+        participants_by_class[label].add(record.participant_id)
+        key = (label, record.participant_id)
+        stratum_counts[key] = stratum_counts.get(key, 0) + 1
+    if any(not participants for participants in participants_by_class.values()):
+        raise ValueError("training records must contain both Valence classes.")
+    class_masses = {0: low_mass, 1: 1.0 - low_mass}
+    weights = torch.tensor(
+        [
+            class_masses[int(label.item())]
+            / len(participants_by_class[int(label.item())])
+            / stratum_counts[(int(label.item()), record.participant_id)]
+            for record, label in zip(record_tuple, labels, strict=True)
+        ],
+        dtype=torch.float64,
+    )
+    if not torch.isclose(weights.sum(), torch.tensor(1.0, dtype=torch.float64)):
+        raise RuntimeError("sampling weights failed to sum to one.")
     return weights
 
 
@@ -1678,7 +1625,7 @@ __all__ = [
     "KEmoConTrainingConfig",
     "build_configured_kemocon_split",
     "build_kemocon_class_weights",
-    "build_bounded_multitask_participant_sampling_weights",
+    "build_valence_class_participant_sampling_weights",
     "build_kemocon_dataset",
     "build_kemocon_lr_scheduler",
     "build_kemocon_model",
