@@ -8,6 +8,8 @@ from emotion_model.physiology.channel_metadata import (
 from emotion_model.physiology.lightweight import (
     LightweightPhysioClassifierOutput,
     LightweightPhysioEmotionClassifier,
+    MultiScaleDilatedConv1dStem,
+    PHYSIOLOGY_ENCODER_MODES,
 )
 from emotion_model.physiology.normalization import (
     ChannelNormalizationStats,
@@ -34,9 +36,11 @@ __all__ = [
     "ChannelwiseZScoreNormalizer",
     "LightweightPhysioClassifierOutput",
     "LightweightPhysioEmotionClassifier",
+    "MultiScaleDilatedConv1dStem",
     "NormalizationFitScope",
     "NormalizationKey",
     "PhysioChannelQuality",
+    "PHYSIOLOGY_ENCODER_MODES",
     "PhysioChannelSpec",
     "PhysioChannelWindow",
     "PhysioFilter",

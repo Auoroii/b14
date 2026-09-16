@@ -4,11 +4,118 @@ import pytest
 import torch
 
 from emotion_model.common import (
+    MaskAwareAttentiveStatisticsPooling,
     masked_mean,
     masked_mean_std,
     masked_population_std,
     masked_population_variance,
 )
+
+
+def test_attentive_statistics_shapes_masks_and_fully_padded_rows() -> None:
+    """Normalize only valid frames and zero every fully padded output."""
+
+    torch.manual_seed(4)
+    pooling = MaskAwareAttentiveStatisticsPooling(3, 5)
+    features = torch.randn(3, 4, 3)
+    valid_mask = torch.tensor(
+        [
+            [True, True, False, False],
+            [False, True, False, True],
+            [False, False, False, False],
+        ]
+    )
+
+    statistics, weights, sample_valid = pooling(features, valid_mask)
+
+    assert statistics.shape == (3, 6)
+    assert weights.shape == (3, 4)
+    assert sample_valid.tolist() == [True, True, False]
+    torch.testing.assert_close(weights[:2].sum(dim=1), torch.ones(2))
+    assert torch.equal(weights.masked_select(~valid_mask), torch.zeros(8))
+    assert torch.equal(weights[2], torch.zeros(4))
+    assert torch.equal(statistics[2], torch.zeros(6))
+    assert bool(torch.isfinite(statistics).all())
+    assert bool(torch.isfinite(weights).all())
+
+
+def test_attentive_statistics_match_weighted_definition() -> None:
+    """Return concatenated weighted population mean and stabilized std."""
+
+    pooling = MaskAwareAttentiveStatisticsPooling(2, 3, epsilon=1.0e-5)
+    features = torch.tensor([[[1.0, 2.0], [3.0, 8.0], [20.0, 30.0]]])
+    valid_mask = torch.tensor([[True, True, False]])
+
+    statistics, weights, _ = pooling(features, valid_mask)
+    safe = torch.where(valid_mask.unsqueeze(-1), features, torch.zeros_like(features))
+    expected_mean = (weights.unsqueeze(-1) * safe).sum(dim=1)
+    expected_variance = (
+        weights.unsqueeze(-1) * (safe - expected_mean.unsqueeze(1)).square()
+    ).sum(dim=1)
+    expected = torch.cat(
+        (expected_mean, torch.sqrt(expected_variance.clamp_min(1.0e-5))),
+        dim=-1,
+    )
+
+    torch.testing.assert_close(statistics, expected)
+
+
+def test_attentive_statistics_single_frame_and_padding_invariance() -> None:
+    """Handle one valid frame and ignore arbitrary non-finite padding values."""
+
+    pooling = MaskAwareAttentiveStatisticsPooling(2, 4)
+    baseline = torch.tensor([[[2.0, -4.0], [0.0, 0.0], [0.0, 0.0]]])
+    changed = baseline.clone()
+    changed[0, 1] = torch.tensor([float("nan"), float("inf")])
+    changed[0, 2] = torch.tensor([1.0e20, -1.0e20])
+    changed.requires_grad_()
+    valid_mask = torch.tensor([[True, False, False]])
+
+    baseline_output = pooling(baseline, valid_mask)
+    changed_output = pooling(changed, valid_mask)
+
+    for baseline_value, changed_value in zip(baseline_output[:2], changed_output[:2]):
+        torch.testing.assert_close(changed_value, baseline_value)
+    torch.testing.assert_close(baseline_output[1], torch.tensor([[1.0, 0.0, 0.0]]))
+    torch.testing.assert_close(
+        baseline_output[0],
+        torch.tensor([[2.0, -4.0, 1.0e-5**0.5, 1.0e-5**0.5]]),
+    )
+    changed_output[0].sum().backward()
+    assert changed.grad is not None
+    assert bool(torch.isfinite(changed.grad).all())
+    assert torch.equal(changed.grad[:, 1:], torch.zeros(1, 2, 2))
+
+
+def test_attentive_statistics_backpropagates_finite_score_gradients() -> None:
+    """Train every score-network parameter through weighted statistics."""
+
+    torch.manual_seed(8)
+    pooling = MaskAwareAttentiveStatisticsPooling(4, 6)
+    features = torch.randn(2, 5, 4, requires_grad=True)
+    valid_mask = torch.tensor(
+        [[True, True, True, False, False], [False, True, True, True, False]]
+    )
+
+    statistics, weights, _ = pooling(features, valid_mask)
+    (statistics.square().sum() + weights.square().sum()).backward()
+
+    gradients = [parameter.grad for parameter in pooling.parameters()]
+    assert gradients
+    assert all(gradient is not None for gradient in gradients)
+    assert all(bool(torch.isfinite(gradient).all()) for gradient in gradients)
+    assert any(bool(torch.count_nonzero(gradient)) for gradient in gradients)
+
+
+def test_attentive_statistics_validates_dimensions_and_parameter_count() -> None:
+    """Reject malformed construction/input and expose the exact lightweight cost."""
+
+    pooling = MaskAwareAttentiveStatisticsPooling(8, 5)
+    assert sum(parameter.numel() for parameter in pooling.parameters()) == 67
+    with pytest.raises(ValueError, match="width"):
+        pooling(torch.ones(2, 3, 7), torch.ones(2, 3, dtype=torch.bool))
+    with pytest.raises(ValueError, match="positive"):
+        MaskAwareAttentiveStatisticsPooling(8, 0)
 
 
 def test_masked_mean_uses_only_valid_positions() -> None:

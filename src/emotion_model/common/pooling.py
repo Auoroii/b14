@@ -1,9 +1,94 @@
 """Numerically safe masked pooling for batched time sequences."""
 
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 
-from emotion_model.common.masking import validate_sequence_mask
+from emotion_model.common.masking import safe_masked_softmax, validate_sequence_mask
+
+
+class MaskAwareAttentiveStatisticsPooling(nn.Module):
+    """Learn weighted mean/std statistics over valid sequence frames.
+
+    Args:
+        feature_dim: Input feature width ``D``.
+        attention_hidden_dim: Hidden width of the lightweight score network.
+        epsilon: Positive variance floor used before the square root.
+
+    Forward accepts floating ``features`` with shape ``[B, T, D]`` and a
+    boolean ``valid_mask`` with shape ``[B, T]``. It returns
+    ``(statistics, attention_weights, sample_valid)`` with shapes ``[B, 2D]``,
+    ``[B, T]``, and ``[B]`` respectively. Fully masked rows return finite
+    zeros for both floating outputs and ``False`` validity.
+    """
+
+    def __init__(
+        self,
+        feature_dim: int,
+        attention_hidden_dim: int = 64,
+        *,
+        epsilon: float = 1.0e-5,
+    ) -> None:
+        super().__init__()
+        for name, value in (
+            ("feature_dim", feature_dim),
+            ("attention_hidden_dim", attention_hidden_dim),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be an integer, not bool.")
+            if value <= 0:
+                raise ValueError(f"{name} must be positive.")
+        if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+            raise TypeError("epsilon must be a real number, not bool.")
+        self.feature_dim = feature_dim
+        self.attention_hidden_dim = attention_hidden_dim
+        self.epsilon = float(epsilon)
+        if not torch.isfinite(torch.tensor(self.epsilon)) or self.epsilon <= 0.0:
+            raise ValueError("epsilon must be finite and positive.")
+        self.attention = nn.Sequential(
+            nn.LayerNorm(feature_dim),
+            nn.Linear(feature_dim, attention_hidden_dim),
+            nn.Tanh(),
+            nn.Linear(attention_hidden_dim, 1),
+        )
+
+    def forward(
+        self,
+        features: Tensor,
+        valid_mask: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Pool ``[B,T,D]`` features into mask-safe statistics ``[B,2D]``."""
+
+        _validate_pooling_inputs(features, valid_mask)
+        if features.shape[-1] != self.feature_dim:
+            raise ValueError(
+                f"features width must be {self.feature_dim}; "
+                f"received {features.shape[-1]}."
+            )
+        safe_features = torch.where(
+            valid_mask.unsqueeze(-1),
+            features,
+            torch.zeros_like(features),
+        )
+        logits = self.attention(safe_features).squeeze(-1)
+        attention_weights = safe_masked_softmax(logits, valid_mask, dim=1)
+        expanded_weights = attention_weights.unsqueeze(-1)
+        mean = (expanded_weights * safe_features).sum(dim=1)
+        centered = torch.where(
+            valid_mask.unsqueeze(-1),
+            safe_features - mean.unsqueeze(1),
+            torch.zeros_like(safe_features),
+        )
+        variance = (expanded_weights * centered.square()).sum(dim=1)
+        sample_valid = valid_mask.any(dim=1)
+        std = torch.sqrt(variance.clamp_min(self.epsilon))
+        std = torch.where(sample_valid.unsqueeze(1), std, torch.zeros_like(std))
+        statistics = torch.cat((mean, std), dim=-1)
+        statistics = torch.where(
+            sample_valid.unsqueeze(1),
+            statistics,
+            torch.zeros_like(statistics),
+        )
+        return statistics, attention_weights, sample_valid
 
 
 def _validate_pooling_inputs(sequence: Tensor, valid_mask: Tensor) -> None:

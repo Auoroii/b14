@@ -9,7 +9,11 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
 
-from emotion_model.common import derive_quadrant_probabilities, masked_mean_std
+from emotion_model.common import (
+    MaskAwareAttentiveStatisticsPooling,
+    derive_quadrant_probabilities,
+    masked_mean_std,
+)
 from emotion_model.speech.emotion_layer_aggregation import EmotionLayerAggregation
 from emotion_model.speech.relation_differential_denoising import (
     NoiseConditionedRelationDifferentialDenoiser,
@@ -21,10 +25,11 @@ from emotion_model.speech.wavlm_encoder import (
 _EMOTION_LAYER_INDICES = (8, 9, 10, 11)
 _NOISE_LAYER_INDICES = (0, 1)
 _RELIABILITY_SCORE_TYPE = "availability_indicator"
-_STATE_VERSION = 1
+_STATE_VERSION = 2
 _MODEL_VARIANT = (
     "lightweight_shared_dynamic_relation_differential_full_window"
 )
+_SPEECH_POOLING_MODES = frozenset({"mean_std", "attentive_stats"})
 
 
 def _positive_integer(value: int, *, name: str) -> int:
@@ -98,6 +103,10 @@ class LightweightNoiseConditionedSpeechClassifier(nn.Module):
         noise_embedding_dim: Continuous acoustic/noise-condition width.
         relation_denoiser: Required V4.2 feature-space relation refinement.
         emotion_layer_aggregation: H9--H12 fixed or learned aggregation.
+        speech_pooling: Emotion-path pooling mode, either ``"mean_std"`` or
+            ``"attentive_stats"``.
+        speech_attention_hidden_dim: Positive hidden width of the attentive
+            score network. It remains fingerprinted in both pooling modes.
         film_scale: Positive finite bound in ``(0, 1]`` for both FiLM terms.
         dropout: Projection dropout probability in ``[0, 1)``.
 
@@ -113,6 +122,8 @@ class LightweightNoiseConditionedSpeechClassifier(nn.Module):
         *,
         relation_denoiser: NoiseConditionedRelationDifferentialDenoiser,
         emotion_layer_aggregation: EmotionLayerAggregation | None = None,
+        speech_pooling: str = "mean_std",
+        speech_attention_hidden_dim: int = 64,
         film_scale: float = 0.1,
         dropout: float = 0.3,
     ) -> None:
@@ -151,6 +162,15 @@ class LightweightNoiseConditionedSpeechClassifier(nn.Module):
                 "relation_denoiser wavlm_hidden_dim must match the WavLM encoder."
             )
         self.relation_denoiser = relation_denoiser
+        if speech_pooling not in _SPEECH_POOLING_MODES:
+            raise ValueError(
+                "speech_pooling must be 'mean_std' or 'attentive_stats'."
+            )
+        self.speech_pooling = speech_pooling
+        self.speech_attention_hidden_dim = _positive_integer(
+            speech_attention_hidden_dim,
+            name="speech_attention_hidden_dim",
+        )
         self.speech_embedding_dim = _positive_integer(
             speech_embedding_dim,
             name="speech_embedding_dim",
@@ -169,6 +189,14 @@ class LightweightNoiseConditionedSpeechClassifier(nn.Module):
         self.full_window_activity_diagnostics_only = True
 
         statistics_dim = 2 * self.wavlm_hidden_dim
+        self.attentive_statistics_pooling = (
+            MaskAwareAttentiveStatisticsPooling(
+                self.wavlm_hidden_dim,
+                self.speech_attention_hidden_dim,
+            )
+            if self.speech_pooling == "attentive_stats"
+            else None
+        )
         self.speech_projection = nn.Sequential(
             nn.LayerNorm(statistics_dim),
             nn.Linear(statistics_dim, self.speech_embedding_dim),
@@ -207,6 +235,8 @@ class LightweightNoiseConditionedSpeechClassifier(nn.Module):
             "noise_embedding_dim": self.noise_embedding_dim,
             "film_scale": self.film_scale,
             "dropout": self.dropout,
+            "speech_pooling": self.speech_pooling,
+            "speech_attention_hidden_dim": self.speech_attention_hidden_dim,
             "emotion_layer_indices": _EMOTION_LAYER_INDICES,
             "noise_layer_indices": _NOISE_LAYER_INDICES,
             "reliability_score_type": _RELIABILITY_SCORE_TYPE,
@@ -322,10 +352,24 @@ class LightweightNoiseConditionedSpeechClassifier(nn.Module):
         differential_gate = relation_output.differential_gate
         differential_lambda = relation_output.differential_lambda
         pooling_emotion_sequence = denoised_emotion_sequence
-        speech_statistics, sample_valid = masked_mean_std(
-            pooling_emotion_sequence,
-            feature_mask,
-        )
+        if self.speech_pooling == "mean_std":
+            speech_statistics, sample_valid = masked_mean_std(
+                pooling_emotion_sequence,
+                feature_mask,
+            )
+            temporal_weights = self._uniform_temporal_weights(
+                feature_mask,
+                dtype=waveform.dtype,
+            )
+        else:
+            if self.attentive_statistics_pooling is None:
+                raise RuntimeError("attentive speech pooling module is missing.")
+            speech_statistics, temporal_weights, sample_valid = (
+                self.attentive_statistics_pooling(
+                    pooling_emotion_sequence,
+                    feature_mask,
+                )
+            )
         noise_statistics, noise_valid = masked_mean_std(
             noise_sequence,
             noise_feature_mask,
@@ -395,10 +439,6 @@ class LightweightNoiseConditionedSpeechClassifier(nn.Module):
                 valence_probabilities.index_select(0, valid_indices),
             ),
         )
-        temporal_weights = self._uniform_temporal_weights(
-            feature_mask,
-            dtype=waveform.dtype,
-        )
         activity_counts = waveform_activity_mask.sum(dim=1, keepdim=True)
         valid_counts = speech_attention_mask.sum(dim=1, keepdim=True).clamp_min(1)
         speech_activity_ratio = activity_counts.to(dtype=waveform.dtype) / (
@@ -432,6 +472,7 @@ class LightweightNoiseConditionedSpeechClassifier(nn.Module):
             arousal_probabilities,
             valence_probabilities,
             quadrant_probabilities,
+            temporal_weights,
         ):
             if not bool(torch.isfinite(value).all()):
                 raise RuntimeError("lightweight speech output contains NaN or Inf.")

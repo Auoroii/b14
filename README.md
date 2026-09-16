@@ -8,6 +8,27 @@
 
 `lightweight_shared_dynamic_relation_differential_full_window`
 
+The formal configuration now represents S1 and keeps mask-aware attentive
+speech pooling. B0 is recovered with `speech_pooling: mean_std`. In both modes
+the only temporal validity input is the WavLM-derived feature attention mask.
+`speech_activity_mask` and `speech_activity_ratio` remain diagnostics and
+never enter pooling scores.
+
+```yaml
+model:
+  speech_pooling: attentive_stats
+  speech_attention_hidden_dim: 64
+  physiology_encoder: single_scale
+  physiology_dilations: [1, 2, 4]
+```
+
+P1 is isolated in
+`configs/kemocon_v4_2_p1_multiscale_dilated_physio.yaml`. It differs from S1
+only by the output directory and `physiology_encoder: multiscale_dilated`.
+Each BVP/EDA/TEMP channel remains independent and uses dilation branches
+1/2/4 followed by concatenation and a 1x1 convolution. Physiology pooling
+remains masked mean/std; no branch attention or quality modulation is used.
+
 ## 模型语义
 
 每条记录使用参与者自己的 5 秒、16 kHz 音频窗口，以及同一时间窗内的 BVP、EDA、TEMP 生理信号。
@@ -39,6 +60,9 @@ python scripts/train_kemocon.py --config configs/kemocon_v4_2_full_window_relati
 python scripts/evaluate_kemocon.py --config configs/kemocon_v4_2_full_window_relation_differential.yaml
 ```
 
+P1 uses the same commands with
+`configs/kemocon_v4_2_p1_multiscale_dilated_physio.yaml`.
+
 训练前可用 CPU 离线测试检查当前实现：
 
 ```bash
@@ -49,7 +73,7 @@ python -m pytest -q
 
 默认 manifest：`artifacts/kemocon/manifest_self.json`
 
-默认实验目录：`runs/kemocon_v4_2_soft_valence_threshold_shrink05_batch80_cv_seed2026/`
+默认 S1 实验目录：`runs/kemocon_v4_2_attentive_stats_s1_cv_seed2026/`
 
 每个 fold 写入 `fold_<index>/`，主要文件包括：
 

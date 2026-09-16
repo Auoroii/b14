@@ -49,7 +49,25 @@ split 以 debate dyad/session 为隔离单位，训练、验证、测试参与�
 
 当前稳定配置完全冻结 WavLM，并对 H9–H12 使用固定均值聚合。顶部 H12 微调造成 Arousal Low 塌缩，可学习 H9–H12 聚合又未产生可测收益，因此两项均不保留。全零有效 waveform 必须返回 finite embedding，不能因 activity diagnostics 全 false 而失败。
 
+Speech emotion pooling after relation differential is configurable as
+`mean_std` or `attentive_stats`. The baseline is `mean_std`. The attentive
+variant scores each valid `[B,T,D]` feature frame with
+LayerNorm--Linear--Tanh--Linear, applies a mask-safe softmax using only the
+WavLM feature attention mask, and returns concatenated weighted mean and
+weighted population standard deviation `[B,2D]`. The H1--H2 noise path retains
+the original masked mean/std pooling. Activity diagnostics are not model
+inputs.
+
 ## 6. Physiology branch
+
+The physiology temporal encoder is an explicit S1/P1 ablation. S1 uses the
+established independent two-layer `single_scale` Conv1D stem. P1 uses an
+independent `multiscale_dilated` stem for each BVP/EDA/TEMP channel: a shared
+1-to-8 kernel-3 projection, three kernel-3 branches with dilations 1/2/4,
+concatenation, and a 1x1 projection back to 16 features. Every convolutional
+stage zeros invalid timesteps. Both modes retain masked mean/std pooling,
+channel availability semantics, preprocessing, and training-fold
+normalization. No cross-channel or quality-aware computation is introduced.
 
 当前生理路径使用 `LightweightPhysioEmotionClassifier`：独立通道 stem、mask-aware temporal pooling、共享 physiology embedding，以及 arousal/valence 辅助 logits。可变长度计算不得使用会污染 padding 统计的 BatchNorm。
 

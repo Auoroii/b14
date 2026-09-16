@@ -18,6 +18,7 @@ from emotion_model.experiments import (
     KEmoConModalityMode,
     build_kemocon_model,
     build_kemocon_optimizer,
+    build_model_parameter_summary,
     load_kemocon_experiment_config,
 )
 from emotion_model.multimodal import (
@@ -251,6 +252,10 @@ def test_builder_selects_new_backend_without_changing_full_window_speech() -> No
     assert config.model.freeze_wavlm
     assert config.model.unfreeze_last_n_layers == 0
     assert config.model.emotion_layer_aggregation == "fixed_mean"
+    assert config.model.speech_pooling == "attentive_stats"
+    assert config.model.speech_attention_hidden_dim == 64
+    assert config.model.physiology_encoder == "single_scale"
+    assert config.model.physiology_dilations == (1, 2, 4)
     assert config.training.wavlm_learning_rate == pytest.approx(1.0e-4)
     assert config.training.min_wavlm_learning_rate is None
     model = _build_configured_model(
@@ -265,6 +270,8 @@ def test_builder_selects_new_backend_without_changing_full_window_speech() -> No
     assert speech.relation_denoiser is not None
     assert speech.wavlm_encoder.trainable_transformer_layer_indices == ()
     assert speech.emotion_layer_aggregation.mode == "fixed_mean"
+    assert speech.speech_pooling == "attentive_stats"
+    assert speech.attentive_statistics_pooling is not None
     layer_logits = speech.emotion_layer_aggregation.emotion_layer_logits
     assert layer_logits is None
     optimizer = build_kemocon_optimizer(
@@ -280,6 +287,58 @@ def test_builder_selects_new_backend_without_changing_full_window_speech() -> No
     assert isinstance(
         model.batch_scheduler.physiology_classifier,
         LightweightPhysioEmotionClassifier,
+    )
+    physiology = model.batch_scheduler.physiology_classifier
+    assert physiology.physiology_encoder == "single_scale"
+    assert physiology.physiology_dilations == (1, 2, 4)
+
+
+def test_p1_changes_only_physiology_and_preserves_s1_speech_output() -> None:
+    """Keep the complete S1 speech branch invariant when selecting P1."""
+
+    torch.manual_seed(120)
+    s1 = _build_configured_model(
+        "configs/kemocon_v4_2_full_window_relation_differential.yaml"
+    )
+    torch.manual_seed(120)
+    p1 = _build_configured_model(
+        "configs/kemocon_v4_2_p1_multiscale_dilated_physio.yaml"
+    )
+    s1_speech = s1.batch_scheduler.speech_classifier
+    p1_speech = p1.batch_scheduler.speech_classifier
+    assert isinstance(s1_speech, LightweightNoiseConditionedSpeechClassifier)
+    assert isinstance(p1_speech, LightweightNoiseConditionedSpeechClassifier)
+    assert s1_speech.get_extra_state() == p1_speech.get_extra_state()
+    for name, value in s1_speech.state_dict().items():
+        other = p1_speech.state_dict()[name]
+        if isinstance(value, torch.Tensor):
+            assert isinstance(other, torch.Tensor)
+            torch.testing.assert_close(value, other)
+
+    waveform = torch.randn(2, 32)
+    speech_mask = torch.ones_like(waveform, dtype=torch.bool)
+    s1_speech.eval()
+    p1_speech.eval()
+    with torch.no_grad():
+        s1_output = s1_speech(waveform, speech_mask)
+        p1_output = p1_speech(waveform, speech_mask)
+    torch.testing.assert_close(
+        s1_output.temporal_attention_weights,
+        p1_output.temporal_attention_weights,
+    )
+    torch.testing.assert_close(
+        s1_output.speech_embedding,
+        p1_output.speech_embedding,
+    )
+
+    s1_parameters = build_model_parameter_summary(s1)
+    p1_parameters = build_model_parameter_summary(p1)
+    assert s1_parameters["physiology_trainable_parameters"] == 8_970
+    assert p1_parameters["physiology_trainable_parameters"] == 12_906
+    assert (
+        p1_parameters["trainable_parameters"]
+        - s1_parameters["trainable_parameters"]
+        == 3_936
     )
 
 

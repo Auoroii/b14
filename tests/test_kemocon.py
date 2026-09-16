@@ -144,6 +144,99 @@ def test_v4_2_rejects_removed_speech_availability_options(
         load_kemocon_experiment_config(path)
 
 
+def test_speech_pooling_config_accepts_attentive_ablation(
+    workspace_tmp_path: Path,
+) -> None:
+    """Parse the single-variable attentive pooling experiment settings."""
+
+    source = Path(
+        "configs/kemocon_v4_2_full_window_relation_differential.yaml"
+    ).read_text(encoding="utf-8")
+    candidate = source.replace(
+        "speech_attention_hidden_dim: 64",
+        "speech_attention_hidden_dim: 17",
+    )
+    path = workspace_tmp_path / "attentive-pooling.yaml"
+    path.write_text(candidate, encoding="utf-8")
+
+    config = load_kemocon_experiment_config(path)
+
+    assert config.model.speech_pooling == "attentive_stats"
+    assert config.model.speech_attention_hidden_dim == 17
+
+
+@pytest.mark.parametrize(
+    ("replacement", "message"),
+    [
+        ("speech_pooling: unsupported", "model.speech_pooling"),
+        ("speech_attention_hidden_dim: 0", "speech_attention_hidden_dim.*positive"),
+    ],
+)
+def test_speech_pooling_config_rejects_invalid_values(
+    workspace_tmp_path: Path,
+    replacement: str,
+    message: str,
+) -> None:
+    """Strictly validate the pooling mode and attention hidden width."""
+
+    source = Path(
+        "configs/kemocon_v4_2_full_window_relation_differential.yaml"
+    ).read_text(encoding="utf-8")
+    original = (
+        "speech_pooling: attentive_stats"
+        if replacement.startswith("speech_pooling")
+        else "speech_attention_hidden_dim: 64"
+    )
+    path = workspace_tmp_path / "invalid-pooling.yaml"
+    path.write_text(source.replace(original, replacement), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        load_kemocon_experiment_config(path)
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "message"),
+    [
+        (
+            "physiology_encoder: single_scale",
+            "physiology_encoder: unsupported",
+            "model.physiology_encoder",
+        ),
+        (
+            "physiology_dilations:\n    - 1\n    - 2\n    - 4",
+            "physiology_dilations: []",
+            "three integers",
+        ),
+        (
+            "physiology_dilations:\n    - 1\n    - 2\n    - 4",
+            "physiology_dilations:\n    - 1\n    - 0\n    - 4",
+            "physiology_dilations values must be positive",
+        ),
+        (
+            "physiology_dilations:\n    - 1\n    - 2\n    - 4",
+            "physiology_dilations:\n    - 1\n    - 2\n    - 2",
+            "three distinct values",
+        ),
+    ],
+)
+def test_physiology_encoder_config_rejects_invalid_values(
+    workspace_tmp_path: Path,
+    old: str,
+    new: str,
+    message: str,
+) -> None:
+    """Strictly reject unsupported encoders and malformed dilation triples."""
+
+    source = Path(
+        "configs/kemocon_v4_2_full_window_relation_differential.yaml"
+    ).read_text(encoding="utf-8")
+    path = workspace_tmp_path / "invalid-physiology-encoder.yaml"
+    path.write_text(source.replace(old, new), encoding="utf-8")
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        load_kemocon_experiment_config(path)
+
+
 def test_manifest_uses_relative_sources_and_drops_audio_tail(
     workspace_tmp_path: Path,
 ) -> None:

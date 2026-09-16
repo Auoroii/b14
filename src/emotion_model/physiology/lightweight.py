@@ -13,7 +13,8 @@ from emotion_model.common import derive_quadrant_probabilities, masked_mean_std
 from emotion_model.physiology.channel_metadata import PhysioChannelSpec
 
 _RELIABILITY_SCORE_TYPE = "availability_indicator"
-_STATE_VERSION = 1
+_STATE_VERSION = 2
+PHYSIOLOGY_ENCODER_MODES = frozenset({"single_scale", "multiscale_dilated"})
 
 
 def _positive_integer(value: int, *, name: str) -> int:
@@ -61,6 +62,106 @@ class _IndependentChannelStem(nn.Module):
         return torch.where(valid_mask, hidden, torch.zeros_like(hidden))
 
 
+class MultiScaleDilatedConv1dStem(nn.Module):
+    """Encode one masked physiology channel at three temporal scales.
+
+    Args:
+        first_dim: Positive shared shallow feature width.
+        second_dim: Positive output width for every dilation branch and the
+            fused output.
+        dilations: Exactly three distinct positive Conv1D dilation values.
+        dropout: Shared shallow-feature dropout probability in ``[0, 1)``.
+
+    Forward accepts floating ``values`` with shape ``[B, 1, T]`` and boolean
+    ``valid_mask`` with shape ``[B, 1, T]``. It returns finite features with
+    shape ``[B, second_dim, T]`` and exact zeros at invalid positions.
+    """
+
+    def __init__(
+        self,
+        first_dim: int,
+        second_dim: int,
+        dilations: Sequence[int] = (1, 2, 4),
+        *,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.first_dim = _positive_integer(first_dim, name="first_dim")
+        self.second_dim = _positive_integer(second_dim, name="second_dim")
+        dilation_values = tuple(dilations)
+        if len(dilation_values) != 3:
+            raise ValueError("dilations must contain exactly three values.")
+        self.dilations = tuple(
+            _positive_integer(value, name=f"dilations[{index}]")
+            for index, value in enumerate(dilation_values)
+        )
+        if len(set(self.dilations)) != len(self.dilations):
+            raise ValueError("dilations must contain three distinct values.")
+        self.dropout_probability = _dropout(dropout, name="dropout")
+        self.shared_convolution = nn.Conv1d(
+            1,
+            self.first_dim,
+            kernel_size=3,
+            dilation=1,
+            padding=1,
+        )
+        self.shared_activation = nn.GELU()
+        self.shared_dropout = nn.Dropout(self.dropout_probability)
+        self.branch_convolutions = nn.ModuleList(
+            nn.Conv1d(
+                self.first_dim,
+                self.second_dim,
+                kernel_size=3,
+                dilation=dilation,
+                padding=dilation,
+            )
+            for dilation in self.dilations
+        )
+        self.fusion_convolution = nn.Conv1d(
+            len(self.dilations) * self.second_dim,
+            self.second_dim,
+            kernel_size=1,
+        )
+        self.fusion_activation = nn.GELU()
+
+    @staticmethod
+    def _validate_inputs(values: Tensor, valid_mask: Tensor) -> None:
+        if not isinstance(values, Tensor) or values.ndim != 3:
+            raise ValueError("values must have exact shape [B, 1, T].")
+        if not values.is_floating_point():
+            raise TypeError("values must be floating point.")
+        if values.shape[0] <= 0 or values.shape[1] != 1 or values.shape[2] <= 0:
+            raise ValueError("values must have non-empty exact shape [B, 1, T].")
+        if not isinstance(valid_mask, Tensor) or valid_mask.dtype != torch.bool:
+            raise TypeError("valid_mask must be a boolean Tensor.")
+        if tuple(valid_mask.shape) != tuple(values.shape):
+            raise ValueError("valid_mask must have the same [B, 1, T] shape.")
+        if valid_mask.device != values.device:
+            raise ValueError("values and valid_mask must be on the same device.")
+        if not bool(torch.isfinite(values[valid_mask]).all()):
+            raise ValueError("valid physiology values must be finite.")
+
+    def forward(self, values: Tensor, valid_mask: Tensor) -> Tensor:
+        """Map masked ``[B,1,T]`` values to finite ``[B,second_dim,T]``."""
+
+        self._validate_inputs(values, valid_mask)
+        safe_values = torch.where(valid_mask, values, torch.zeros_like(values))
+        hidden = self.shared_convolution(safe_values)
+        hidden = torch.where(valid_mask, hidden, torch.zeros_like(hidden))
+        hidden = self.shared_dropout(self.shared_activation(hidden))
+        hidden = torch.where(valid_mask, hidden, torch.zeros_like(hidden))
+        branches = []
+        for convolution in self.branch_convolutions:
+            branch = convolution(hidden)
+            branch = torch.where(valid_mask, branch, torch.zeros_like(branch))
+            branches.append(branch)
+        concatenated = torch.cat(branches, dim=1)
+        fused = self.fusion_convolution(concatenated)
+        fused = torch.where(valid_mask, fused, torch.zeros_like(fused))
+        fused = self.fusion_activation(fused)
+        return torch.where(valid_mask, fused, torch.zeros_like(fused))
+
+
 @dataclass(frozen=True)
 class LightweightPhysioClassifierOutput:
     """Outputs of the lightweight physiology classifier.
@@ -97,6 +198,10 @@ class LightweightPhysioEmotionClassifier(nn.Module):
         physiology_embedding_dim: Output embedding width.
         dropout: Statistics-projection dropout in ``[0, 1)``.
         stem_dropout: Per-channel stem dropout in ``[0, 1)``.
+        physiology_encoder: ``"single_scale"`` for the established two-layer
+            stem or ``"multiscale_dilated"`` for the P1 encoder.
+        physiology_dilations: Exactly three distinct positive dilation values
+            fingerprinted for both encoder modes.
 
     Forward consumes physiology ``[B,T,C]`` and boolean validity
     ``[B,T,C]`` plus optional boolean time ``[B,T]`` and channel ``[B,C]``
@@ -111,6 +216,8 @@ class LightweightPhysioEmotionClassifier(nn.Module):
         *,
         dropout: float = 0.3,
         stem_dropout: float = 0.1,
+        physiology_encoder: str = "single_scale",
+        physiology_dilations: Sequence[int] = (1, 2, 4),
     ) -> None:
         super().__init__()
         specs = tuple(channel_specs)
@@ -132,10 +239,40 @@ class LightweightPhysioEmotionClassifier(nn.Module):
         )
         self.dropout = _dropout(dropout, name="dropout")
         self.stem_dropout = _dropout(stem_dropout, name="stem_dropout")
-        self.channel_stems = nn.ModuleList(
-            _IndependentChannelStem(first_dim, second_dim, self.stem_dropout)
-            for _ in specs
+        if physiology_encoder not in PHYSIOLOGY_ENCODER_MODES:
+            raise ValueError(
+                "physiology_encoder must be 'single_scale' or "
+                "'multiscale_dilated'."
+            )
+        self.physiology_encoder = physiology_encoder
+        dilation_values = tuple(physiology_dilations)
+        if len(dilation_values) != 3:
+            raise ValueError(
+                "physiology_dilations must contain exactly three values."
+            )
+        self.physiology_dilations = tuple(
+            _positive_integer(value, name=f"physiology_dilations[{index}]")
+            for index, value in enumerate(dilation_values)
         )
+        if len(set(self.physiology_dilations)) != 3:
+            raise ValueError(
+                "physiology_dilations must contain three distinct values."
+            )
+        if self.physiology_encoder == "single_scale":
+            self.channel_stems = nn.ModuleList(
+                _IndependentChannelStem(first_dim, second_dim, self.stem_dropout)
+                for _ in specs
+            )
+        else:
+            self.channel_stems = nn.ModuleList(
+                MultiScaleDilatedConv1dStem(
+                    first_dim,
+                    second_dim,
+                    self.physiology_dilations,
+                    dropout=self.stem_dropout,
+                )
+                for _ in specs
+            )
         statistics_dim = len(specs) * (2 * second_dim) + len(specs)
         self.statistics_dim = statistics_dim
         self.embedding_projection = nn.Sequential(
@@ -166,6 +303,8 @@ class LightweightPhysioEmotionClassifier(nn.Module):
             "physiology_embedding_dim": self.physiology_embedding_dim,
             "dropout": self.dropout,
             "stem_dropout": self.stem_dropout,
+            "physiology_encoder": self.physiology_encoder,
+            "physiology_dilations": self.physiology_dilations,
             "reliability_score_type": _RELIABILITY_SCORE_TYPE,
         }
 
@@ -383,6 +522,8 @@ class LightweightPhysioEmotionClassifier(nn.Module):
 
 
 __all__ = [
+    "MultiScaleDilatedConv1dStem",
+    "PHYSIOLOGY_ENCODER_MODES",
     "LightweightPhysioClassifierOutput",
     "LightweightPhysioEmotionClassifier",
 ]

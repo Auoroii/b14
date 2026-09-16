@@ -2,7 +2,7 @@ paths:
   data_root: data/K-EmoCon
   manifest: artifacts/kemocon/manifest_self.json
   wavlm_model: models/wavlm-base
-  output_dir: runs/kemocon_v4_2_attentive_stats_s1_cv_seed2026
+  output_dir: runs/kemocon_v4_2_p1_multiscale_dilated_physio_cv_seed2026
 
 dataset:
   annotation_perspective: self
@@ -34,7 +34,7 @@ model:
   physiology_stem_channels:
     - 8
     - 16
-  physiology_encoder: single_scale
+  physiology_encoder: multiscale_dilated
   physiology_dilations:
     - 1
     - 2

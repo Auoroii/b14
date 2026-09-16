@@ -254,6 +254,89 @@ def test_classifier_uses_one_forward_raw_layers_denoised_pooling_and_global_film
     assert classifier.film is not None
 
 
+def test_attentive_classifier_reports_learned_weights_and_ignores_activity() -> None:
+    """Use only the WavLM feature mask for attentive emotion pooling."""
+
+    torch.manual_seed(29)
+    encoder = WavLMEncoder(_tiny_wavlm(), freeze_wavlm=True)
+    denoiser = NoiseConditionedRelationDifferentialDenoiser(
+        24,
+        differential_dim=8,
+        num_heads=2,
+    )
+    classifier = LightweightNoiseConditionedSpeechClassifier(
+        encoder,
+        speech_embedding_dim=8,
+        noise_embedding_dim=4,
+        relation_denoiser=denoiser,
+        speech_pooling="attentive_stats",
+        speech_attention_hidden_dim=7,
+        dropout=0.0,
+    ).eval()
+    feature_mask = torch.tensor([[True, True, True, False]])
+    hidden = tuple(torch.randn(1, 4, 24) for _ in range(12))
+    waveform = torch.ones(1, 64)
+    waveform_mask = torch.ones_like(waveform, dtype=torch.bool)
+    inactive = torch.zeros_like(waveform_mask)
+    active = waveform_mask.clone()
+    encoded = WavLMEncoderOutput(hidden, feature_mask)
+    with patch.object(encoder, "forward", return_value=encoded):
+        inactive_output = classifier(
+            waveform,
+            waveform_mask,
+            speech_activity_mask=inactive,
+        )
+        active_output = classifier(
+            waveform,
+            waveform_mask,
+            speech_activity_mask=active,
+        )
+
+    assert inactive_output.speech_activity_ratio.item() == 0.0
+    assert active_output.speech_activity_ratio.item() == 1.0
+    torch.testing.assert_close(
+        inactive_output.temporal_attention_weights,
+        active_output.temporal_attention_weights,
+    )
+    torch.testing.assert_close(
+        inactive_output.speech_embedding,
+        active_output.speech_embedding,
+    )
+    weights = inactive_output.temporal_attention_weights
+    torch.testing.assert_close(weights.sum(dim=1), torch.ones(1))
+    assert torch.equal(weights[:, 3], torch.zeros(1))
+    assert bool(torch.isfinite(weights).all())
+
+
+def test_speech_pooling_fingerprint_rejects_mode_and_hidden_width_mismatch() -> None:
+    """Prevent checkpoint reuse across attentive-pooling architectures."""
+
+    encoder = WavLMEncoder(_tiny_wavlm(), freeze_wavlm=True)
+
+    def classifier(mode: str, hidden_dim: int) -> LightweightNoiseConditionedSpeechClassifier:
+        return LightweightNoiseConditionedSpeechClassifier(
+            encoder,
+            speech_embedding_dim=8,
+            noise_embedding_dim=4,
+            relation_denoiser=NoiseConditionedRelationDifferentialDenoiser(
+                24,
+                differential_dim=8,
+                num_heads=2,
+            ),
+            speech_pooling=mode,
+            speech_attention_hidden_dim=hidden_dim,
+            dropout=0.0,
+        )
+
+    baseline_state = classifier("mean_std", 64).get_extra_state()
+    attentive = classifier("attentive_stats", 64)
+    different_width = classifier("attentive_stats", 32)
+    with pytest.raises(RuntimeError, match="configuration does not match"):
+        attentive.set_extra_state(baseline_state)
+    with pytest.raises(RuntimeError, match="configuration does not match"):
+        different_width.set_extra_state(attentive.get_extra_state())
+
+
 def test_frozen_wavlm_classifier_backpropagates_into_relation_and_keeps_film() -> None:
     """Train refinement downstream of one frozen WavLM forward and global FiLM."""
 

@@ -13,6 +13,7 @@ from emotion_model.common.masking import (
     validate_sequence_mask,
 )
 from emotion_model.common.pooling import (
+    MaskAwareAttentiveStatisticsPooling,
     masked_mean,
     masked_mean_std,
     masked_population_std,
@@ -21,6 +22,7 @@ from emotion_model.common.pooling import (
 
 __all__ = [
     "LabelProtocol",
+    "MaskAwareAttentiveStatisticsPooling",
     "apply_query_mask",
     "binarize_emotion_scores",
     "derive_quadrant_labels",

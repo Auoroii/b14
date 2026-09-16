@@ -114,6 +114,10 @@ class KEmoConModelConfig:
     freeze_wavlm: bool
     unfreeze_last_n_layers: int
     emotion_layer_aggregation: str = "fixed_mean"
+    speech_pooling: str = "mean_std"
+    speech_attention_hidden_dim: int = 64
+    physiology_encoder: str = "single_scale"
+    physiology_dilations: tuple[int, int, int] = (1, 2, 4)
     fusion_gate_hidden_dim: int = 32
     differential_dim: int = 32
     differential_heads: int = 4
@@ -263,6 +267,10 @@ _MODEL_FIELDS = frozenset(
         "freeze_wavlm",
         "unfreeze_last_n_layers",
         "emotion_layer_aggregation",
+        "speech_pooling",
+        "speech_attention_hidden_dim",
+        "physiology_encoder",
+        "physiology_dilations",
         "differential_dim",
         "differential_heads",
         "differential_lambda_init",
@@ -358,6 +366,21 @@ def _integer_pair(section: Mapping[str, object], name: str) -> tuple[int, int]:
     return cast(tuple[int, int], items)
 
 
+def _integer_triple(
+    section: Mapping[str, object],
+    name: str,
+) -> tuple[int, int, int]:
+    value = section.get(name)
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise TypeError(f"{name} must be a sequence of three integers.")
+    items = tuple(value)
+    if len(items) != 3 or any(
+        isinstance(item, bool) or not isinstance(item, int) for item in items
+    ):
+        raise TypeError(f"{name} must contain exactly three integers, not bool.")
+    return cast(tuple[int, int, int], items)
+
+
 def _parse_model_config(
     model: Mapping[str, object],
 ) -> KEmoConModelConfig:
@@ -390,6 +413,26 @@ def _parse_model_config(
             _string(model, "emotion_layer_aggregation")
             if "emotion_layer_aggregation" in model
             else "fixed_mean"
+        ),
+        speech_pooling=(
+            _string(model, "speech_pooling")
+            if "speech_pooling" in model
+            else "mean_std"
+        ),
+        speech_attention_hidden_dim=(
+            _integer(model, "speech_attention_hidden_dim")
+            if "speech_attention_hidden_dim" in model
+            else 64
+        ),
+        physiology_encoder=(
+            _string(model, "physiology_encoder")
+            if "physiology_encoder" in model
+            else "single_scale"
+        ),
+        physiology_dilations=(
+            _integer_triple(model, "physiology_dilations")
+            if "physiology_dilations" in model
+            else (1, 2, 4)
         ),
         fusion_gate_hidden_dim=(
             _integer(model, "fusion_gate_hidden_dim")
@@ -761,6 +804,9 @@ def _validate_config(config: KEmoConExperimentConfig) -> None:
         "model.fusion_gate_hidden_dim": config.model.fusion_gate_hidden_dim,
         "model.differential_dim": config.model.differential_dim,
         "model.differential_heads": config.model.differential_heads,
+        "model.speech_attention_hidden_dim": (
+            config.model.speech_attention_hidden_dim
+        ),
         "training.batch_size": config.training.batch_size,
         "training.epochs": config.training.epochs,
         "training.early_stopping_patience": (
@@ -865,6 +911,24 @@ def _validate_config(config: KEmoConExperimentConfig) -> None:
         raise ValueError(
             "lightweight model.emotion_layer_aggregation must be "
             "'fixed_mean' or 'learnable_weighted'."
+        )
+    if config.model.speech_pooling not in {"mean_std", "attentive_stats"}:
+        raise ValueError(
+            "model.speech_pooling must be 'mean_std' or 'attentive_stats'."
+        )
+    if config.model.physiology_encoder not in {
+        "single_scale",
+        "multiscale_dilated",
+    }:
+        raise ValueError(
+            "model.physiology_encoder must be 'single_scale' or "
+            "'multiscale_dilated'."
+        )
+    if any(value <= 0 for value in config.model.physiology_dilations):
+        raise ValueError("model.physiology_dilations values must be positive.")
+    if len(set(config.model.physiology_dilations)) != 3:
+        raise ValueError(
+            "model.physiology_dilations must contain three distinct values."
         )
     if not 0.0 <= config.model.dropout < 1.0:
         raise ValueError("model.dropout must lie in [0, 1).")
@@ -1288,6 +1352,8 @@ def _build_kemocon_physiology_classifier(
             model_config.physiology_embedding_dim,
             dropout=model_config.dropout,
             stem_dropout=0.1,
+            physiology_encoder=model_config.physiology_encoder,
+            physiology_dilations=model_config.physiology_dilations,
         ),
         model_config.physiology_embedding_dim,
     )
@@ -1315,6 +1381,10 @@ def _build_kemocon_speech_classifier(
             model_config.noise_embedding_dim,
             emotion_layer_aggregation=EmotionLayerAggregation(
                 model_config.emotion_layer_aggregation,
+            ),
+            speech_pooling=model_config.speech_pooling,
+            speech_attention_hidden_dim=(
+                model_config.speech_attention_hidden_dim
             ),
             relation_denoiser=relation_denoiser,
             film_scale=model_config.film_scale,
