@@ -335,8 +335,8 @@ def test_multiscale_rejects_invalid_dilation_contract(
         MultiScaleDilatedConv1dStem(4, 6, dilations)
 
 
-def test_s1_and_p1_configs_differ_only_by_encoder_and_output_path() -> None:
-    """Keep every model/training variable except the P1 encoder identical."""
+def test_historical_p1_remains_isolated_from_new_speech_aux_objective() -> None:
+    """Retain P1 results while the formal config adopts the new objective."""
 
     s1 = load_kemocon_experiment_config(_S1_CONFIG)
     p1 = load_kemocon_experiment_config(_P1_CONFIG)
@@ -350,9 +350,12 @@ def test_s1_and_p1_configs_differ_only_by_encoder_and_output_path() -> None:
         2,
         4,
     )
+    assert s1.loss.speech_aux_min_activity_ratio == 0.0
+    assert p1.loss.speech_aux_min_activity_ratio is None
     normalized_p1 = replace(
         p1,
         paths=s1.paths,
         model=replace(p1.model, physiology_encoder="single_scale"),
+        loss=replace(p1.loss, speech_aux_min_activity_ratio=0.0),
     )
     assert normalized_p1 == s1

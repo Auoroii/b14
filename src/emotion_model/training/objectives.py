@@ -41,6 +41,21 @@ def _finite_nonnegative_real(value: float, *, name: str) -> float:
     return normalized
 
 
+def _optional_activity_ratio_threshold(
+    value: float | None,
+    *,
+    name: str,
+) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be a real number or None, not bool.")
+    normalized = float(value)
+    if not math.isfinite(normalized) or not 0.0 <= normalized < 1.0:
+        raise ValueError(f"{name} must be finite and lie in [0, 1).")
+    return normalized
+
+
 @dataclass(frozen=True)
 class MultimodalLossWeights:
     """Non-negative coefficients for multimodal objective components.
@@ -127,13 +142,20 @@ class EmotionTaskClassWeights:
 
 @dataclass(frozen=True)
 class MultimodalObjectiveConfig:
-    """Immutable multimodal objective selection and scalar configuration."""
+    """Immutable multimodal objective selection and scalar configuration.
+
+    ``speech_aux_min_activity_ratio`` is ``None`` for unfiltered auxiliary
+    supervision. Otherwise, compact speech rows are supervised only when the
+    full-batch activity observation is present and its ratio ``[B]`` is
+    strictly greater than this threshold.
+    """
 
     loss_kind: ClassificationLossKind = (
         ClassificationLossKind.WEIGHTED_CROSS_ENTROPY
     )
     weights: MultimodalLossWeights = MultimodalLossWeights()
     focal_gamma: float = 2.0
+    speech_aux_min_activity_ratio: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.loss_kind, ClassificationLossKind):
@@ -142,6 +164,11 @@ class MultimodalObjectiveConfig:
             raise TypeError("weights must be MultimodalLossWeights.")
         gamma = _finite_nonnegative_real(self.focal_gamma, name="focal_gamma")
         object.__setattr__(self, "focal_gamma", gamma)
+        threshold = _optional_activity_ratio_threshold(
+            self.speech_aux_min_activity_ratio,
+            name="speech_aux_min_activity_ratio",
+        )
+        object.__setattr__(self, "speech_aux_min_activity_ratio", threshold)
 
 
 @dataclass(frozen=True)
@@ -528,6 +555,46 @@ class MultimodalTrainingObjective(nn.Module):
             batch.quadrant_labels.index_select(0, local_indices).to(device=device),
         )
 
+    def _speech_compact_labels(
+        self,
+        batch: AlignedMultimodalBatch,
+        indices: Tensor,
+        *,
+        device: torch.device,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Select and activity-mask speech targets with compact shape ``[Bs]``."""
+
+        labels = self._compact_labels(batch, indices, device=device)
+        threshold = self.config.speech_aux_min_activity_ratio
+        if threshold is None:
+            return labels
+        ratios = batch.speech_activity_ratios
+        observed = batch.speech_activity_observed
+        if ratios is None or observed is None:
+            raise RuntimeError(
+                "speech auxiliary activity filtering requires observed "
+                "speech activity diagnostics."
+            )
+        local_indices = indices.to(device=ratios.device)
+        compact_ratios = ratios.index_select(0, local_indices)
+        compact_observed = observed.index_select(0, local_indices)
+        if not bool(compact_observed.all()):
+            raise RuntimeError(
+                "speech auxiliary activity filtering requires observed "
+                "speech activity diagnostics."
+            )
+        supervision_valid = compact_observed & (compact_ratios > threshold)
+        supervision_valid = supervision_valid.to(device=device)
+        masked_labels = tuple(
+            torch.where(
+                supervision_valid,
+                label,
+                torch.full_like(label, batch.label_ignore_index),
+            )
+            for label in labels
+        )
+        return masked_labels[0], masked_labels[1], masked_labels[2]
+
     @staticmethod
     def _validate_compact(
         output: LightweightSpeechClassifierOutput | LightweightPhysioClassifierOutput,
@@ -605,8 +672,9 @@ class MultimodalTrainingObjective(nn.Module):
                 logits, or enabled compact output contradicts batch presence.
 
         Protocol ignores are retained. Fused unavailable rows are additionally
-        ignored, while auxiliary targets are selected only by compact batch
-        indices. Inputs are never modified.
+        ignored. Auxiliary targets are selected by compact batch indices; when
+        configured, speech targets also require an observed activity ratio
+        strictly above the threshold. Inputs are never modified.
         """
         _, reference = self._validate_inputs(model_output, batch)
         if class_weights is None:
@@ -687,7 +755,7 @@ class MultimodalTrainingObjective(nn.Module):
                     name="speech",
                 )
             )
-            speech_labels = self._compact_labels(
+            speech_labels = self._speech_compact_labels(
                 batch,
                 indices,
                 device=reference.device,

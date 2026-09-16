@@ -52,7 +52,9 @@ _CHANNEL_FILES = {
     "bvp": ("e4_data", "E4_BVP", ".csv"),
     "eda": ("e4_data", "E4_EDA", ".csv"),
     "temperature": ("e4_data", "E4_TEMP", ".csv"),
-    "heart_rate": ("neurosky_polar_data", "Polar_HR", ".csv"),
+    # ``ecg`` corresponds to the Polar H7 heart-rate signal stored in
+    # ``Polar_HR.csv``.  It is a low-frequency HR sequence, not raw ECG.
+    "ecg": ("neurosky_polar_data", "Polar_HR", ".csv"),
 }
 _DEFAULT_CHANNEL_NAMES = ("bvp", "eda", "temperature")
 
@@ -106,11 +108,11 @@ def kemocon_channel_specs(
 
     Args:
         channel_names: Ordered non-empty subset of ``bvp``, ``eda``,
-            ``temperature``, and ``heart_rate``.
+            ``temperature``, and ``ecg``.
 
     Returns:
         Ordered immutable channel specifications. BVP uses arbitrary sensor
-        units; Polar_HR is declared as heart rate rather than raw ECG.
+        units; ``ecg`` is declared as heart rate rather than raw ECG.
     """
 
     if isinstance(channel_names, (str, bytes)) or not isinstance(
@@ -145,11 +147,12 @@ def kemocon_channel_specs(
             4.0,
             "degC",
         ),
-        "heart_rate": PhysioChannelSpec(
-            "heart_rate",
+        "ecg": PhysioChannelSpec(
+            "ecg",
             PhysioSignalKind.HEART_RATE,
             1.0,
             "bpm",
+            "Polar H7 heart-rate signal stored in Polar_HR.csv; not raw ECG waveform.",
         ),
     }
     return tuple(available[name] for name in names)
@@ -564,14 +567,30 @@ class KEmoConPhysioAdapter(PhysioSourceAdapter):
         order = sorted(range(len(timestamps)), key=timestamps.__getitem__)
         unique_timestamps: list[float] = []
         unique_values: list[float] = []
+        duplicate_values: list[float] = []
         previous: float | None = None
         for index in order:
             timestamp = timestamps[index]
-            if previous is not None and timestamp <= previous:
+            if previous is not None and timestamp == previous:
+                duplicate_values.append(values[index])
                 continue
+            if duplicate_values:
+                finite_duplicates = [value for value in duplicate_values if math.isfinite(value)]
+                unique_values.append(
+                    sum(finite_duplicates) / len(finite_duplicates)
+                    if finite_duplicates
+                    else float("nan")
+                )
             unique_timestamps.append(timestamp)
-            unique_values.append(values[index])
+            duplicate_values = [values[index]]
             previous = timestamp
+        if duplicate_values:
+            finite_duplicates = [value for value in duplicate_values if math.isfinite(value)]
+            unique_values.append(
+                sum(finite_duplicates) / len(finite_duplicates)
+                if finite_duplicates
+                else float("nan")
+            )
         timestamp_tensor = torch.tensor(unique_timestamps, dtype=torch.float64)
         value_tensor = torch.tensor(unique_values, dtype=torch.float32)
         valid = torch.isfinite(value_tensor)

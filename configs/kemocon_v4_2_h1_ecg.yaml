@@ -1,8 +1,8 @@
 paths:
   data_root: data/K-EmoCon
-  manifest: artifacts/kemocon/manifest_self.json
+  manifest: artifacts/kemocon/manifest_self_h1_ecg.json
   wavlm_model: models/wavlm-base
-  output_dir: runs/kemocon_v4_2_speechaux_nonsilent_cv_seed2026
+  output_dir: runs/kemocon_v4_2_h1_ecg_cv_seed2026
 
 dataset:
   annotation_perspective: self
@@ -10,9 +10,11 @@ dataset:
     - bvp
     - eda
     - temperature
+    - ecg
   window_seconds: 5.0
   speech_sample_rate_hz: 16000
   physio_target_sample_rate_hz: 64.0
+  ecg_sample_rate_hz: 1.0
   label_protocol: official_mid_high
   speech_activity:
     enabled: true
@@ -40,6 +42,8 @@ model:
     - 2
     - 4
   physiology_embedding_dim: 64
+  ecg_embedding_dim: 16
+  ecg_encoder_type: mask_aware_statistics_mlp
   fusion_dim: 64
   classifier_hidden_dim: 64
   film_scale: 0.1

@@ -243,6 +243,12 @@ class PhysioSubBatch:
     physio_quality_features: Tensor
     channel_names: tuple[str, ...]
     batch_indices: Tensor
+    ecg_values: Tensor | None = None
+    ecg_valid_mask: Tensor | None = None
+    ecg_timestamps_seconds: Tensor | None = None
+    ecg_timeline_mask: Tensor | None = None
+    ecg_timeline_lengths: Tensor | None = None
+    ecg_available: Tensor | None = None
 
     def __post_init__(self) -> None:
         values = _require_tensor(self.physio_input, name="physio_input")
@@ -287,10 +293,6 @@ class PhysioSubBatch:
         if not torch.equal(time_mask, valid_mask.any(dim=2)):
             raise ValueError(
                 "physio_time_mask must equal physio_valid_mask.any(dim=2)."
-            )
-        if not bool(time_mask.any(dim=1).all()):
-            raise ValueError(
-                "every PhysioSubBatch row must contain a valid physiology value."
             )
 
         channel_mask = _require_tensor(
@@ -437,6 +439,90 @@ class PhysioSubBatch:
             expected_length=batch_size,
             name="batch_indices",
         )
+        self._validate_ecg(batch_size=batch_size, dtype=values.dtype)
+        ecg_available = (
+            torch.zeros(batch_size, dtype=torch.bool)
+            if self.ecg_available is None
+            else self.ecg_available
+        )
+        if not bool((time_mask.any(dim=1) | ecg_available).all()):
+            raise ValueError(
+                "every PhysioSubBatch row must contain dense physiology or ECG."
+            )
+
+    def _validate_ecg(self, *, batch_size: int, dtype: torch.dtype) -> None:
+        """Validate optional right-padded ECG-HR tensors ``[Bp, Temax]``."""
+        fields = (
+            self.ecg_values,
+            self.ecg_valid_mask,
+            self.ecg_timestamps_seconds,
+            self.ecg_timeline_mask,
+            self.ecg_timeline_lengths,
+            self.ecg_available,
+        )
+        if all(value is None for value in fields):
+            return
+        if not all(isinstance(value, Tensor) for value in fields):
+            raise TypeError("all ECG subbatch fields must be provided together.")
+        assert isinstance(self.ecg_values, Tensor)
+        assert isinstance(self.ecg_valid_mask, Tensor)
+        assert isinstance(self.ecg_timestamps_seconds, Tensor)
+        assert isinstance(self.ecg_timeline_mask, Tensor)
+        assert isinstance(self.ecg_timeline_lengths, Tensor)
+        assert isinstance(self.ecg_available, Tensor)
+        if self.ecg_values.ndim != 2 or self.ecg_values.shape[0] != batch_size:
+            raise ValueError("ecg_values must have shape [Bp, Temax].")
+        shape = tuple(self.ecg_values.shape)
+        if self.ecg_values.dtype != dtype:
+            raise TypeError("ecg_values must share physio_input dtype.")
+        if (
+            self.ecg_valid_mask.dtype != torch.bool
+            or tuple(self.ecg_valid_mask.shape) != shape
+        ):
+            raise ValueError("ecg_valid_mask must be bool [Bp, Temax].")
+        if (
+            self.ecg_timestamps_seconds.dtype != torch.float64
+            or tuple(self.ecg_timestamps_seconds.shape) != shape
+        ):
+            raise ValueError("ecg_timestamps_seconds must be float64 [Bp, Temax].")
+        if (
+            self.ecg_timeline_mask.dtype != torch.bool
+            or tuple(self.ecg_timeline_mask.shape) != shape
+        ):
+            raise ValueError("ecg_timeline_mask must be bool [Bp, Temax].")
+        if (
+            self.ecg_timeline_lengths.dtype != torch.long
+            or tuple(self.ecg_timeline_lengths.shape) != (batch_size,)
+        ):
+            raise ValueError("ecg_timeline_lengths must be long [Bp].")
+        if (
+            self.ecg_available.dtype != torch.bool
+            or tuple(self.ecg_available.shape) != (batch_size,)
+        ):
+            raise ValueError("ecg_available must be bool [Bp].")
+        for name, tensor in (
+            ("ecg_values", self.ecg_values),
+            ("ecg_valid_mask", self.ecg_valid_mask),
+            ("ecg_timestamps_seconds", self.ecg_timestamps_seconds),
+            ("ecg_timeline_mask", self.ecg_timeline_mask),
+            ("ecg_timeline_lengths", self.ecg_timeline_lengths),
+            ("ecg_available", self.ecg_available),
+        ):
+            _require_cpu(tensor, name=name)
+        max_length = shape[1]
+        expected_timeline = (
+            torch.arange(max_length).unsqueeze(0)
+            < self.ecg_timeline_lengths.unsqueeze(1)
+        )
+        if not torch.equal(self.ecg_timeline_mask, expected_timeline):
+            raise ValueError("ecg_timeline_mask must match ecg_timeline_lengths.")
+        if bool((self.ecg_valid_mask & ~self.ecg_timeline_mask).any()):
+            raise ValueError("ECG valid points must lie inside the ECG timeline.")
+        if not torch.equal(self.ecg_available, self.ecg_valid_mask.any(dim=1)):
+            raise ValueError("ecg_available must equal ecg_valid_mask.any(dim=1).")
+        if not bool(torch.isfinite(self.ecg_values).all()):
+            raise ValueError("ecg_values must be finite.")
+        _require_zero_where_invalid(self.ecg_values, self.ecg_valid_mask, name="ecg_values")
 
     def pin_memory(self) -> PhysioSubBatch:
         """Return an equivalent page-locked physiology subbatch.
@@ -460,6 +546,28 @@ class PhysioSubBatch:
             physio_quality_features=self.physio_quality_features.pin_memory(),
             channel_names=self.channel_names,
             batch_indices=self.batch_indices.pin_memory(),
+            ecg_values=(None if self.ecg_values is None else self.ecg_values.pin_memory()),
+            ecg_valid_mask=(
+                None if self.ecg_valid_mask is None else self.ecg_valid_mask.pin_memory()
+            ),
+            ecg_timestamps_seconds=(
+                None
+                if self.ecg_timestamps_seconds is None
+                else self.ecg_timestamps_seconds.pin_memory()
+            ),
+            ecg_timeline_mask=(
+                None
+                if self.ecg_timeline_mask is None
+                else self.ecg_timeline_mask.pin_memory()
+            ),
+            ecg_timeline_lengths=(
+                None
+                if self.ecg_timeline_lengths is None
+                else self.ecg_timeline_lengths.pin_memory()
+            ),
+            ecg_available=(
+                None if self.ecg_available is None else self.ecg_available.pin_memory()
+            ),
         )
 
 
@@ -504,6 +612,7 @@ class AlignedMultimodalBatch:
     physiology: PhysioSubBatch | None
     speech_activity_ratios: Tensor | None = None
     speech_activity_observed: Tensor | None = None
+    ecg_available: Tensor | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -628,6 +737,14 @@ class AlignedMultimodalBatch:
             subbatch_type=PhysioSubBatch,
             name="physiology",
         )
+        if self.ecg_available is not None:
+            ecg_available = self._validate_availability(
+                self.ecg_available,
+                name="ecg_available",
+                batch_size=batch_size,
+            )
+            if bool((ecg_available & ~physiology_available).any()):
+                raise ValueError("ECG availability must imply physiology availability.")
         activity_ratios = self.speech_activity_ratios
         activity_observed = self.speech_activity_observed
         if activity_ratios is not None:
@@ -709,6 +826,9 @@ class AlignedMultimodalBatch:
                 None
                 if self.speech_activity_observed is None
                 else self.speech_activity_observed.pin_memory()
+            ),
+            ecg_available=(
+                None if self.ecg_available is None else self.ecg_available.pin_memory()
             ),
         )
 
@@ -893,6 +1013,39 @@ def _collate_physiology(
         channel_masks.append(sample.physio_channel_mask)
         quality_matrices.append(sample.physio_channel_quality)
         quality_features.append(sample.physio_quality_features)
+    ecg_enabled = selected[0].ecg_values is not None
+    if any((sample.ecg_values is not None) != ecg_enabled for sample in samples):
+        raise ValueError("all samples must share the same ECG tensor contract.")
+    ecg_values: Tensor | None = None
+    ecg_valid_mask: Tensor | None = None
+    ecg_timestamps: Tensor | None = None
+    ecg_timeline_mask: Tensor | None = None
+    ecg_lengths: Tensor | None = None
+    ecg_available: Tensor | None = None
+    if ecg_enabled:
+        lengths_ecg = []
+        for sample in selected:
+            assert sample.ecg_values is not None
+            lengths_ecg.append(sample.ecg_values.shape[0])
+        max_ecg_length = max(lengths_ecg)
+        ecg_values = torch.zeros((batch_size, max_ecg_length), dtype=dtype)
+        ecg_valid_mask = torch.zeros_like(ecg_values, dtype=torch.bool)
+        ecg_timestamps = torch.zeros(
+            (batch_size, max_ecg_length), dtype=torch.float64
+        )
+        ecg_timeline_mask = torch.zeros_like(ecg_valid_mask)
+        for row, (sample, length) in enumerate(
+            zip(selected, lengths_ecg, strict=True)
+        ):
+            assert sample.ecg_values is not None
+            assert sample.ecg_valid_mask is not None
+            assert sample.ecg_timestamps_seconds is not None
+            ecg_values[row, :length].copy_(sample.ecg_values)
+            ecg_valid_mask[row, :length].copy_(sample.ecg_valid_mask)
+            ecg_timestamps[row, :length].copy_(sample.ecg_timestamps_seconds)
+            ecg_timeline_mask[row, :length] = True
+        ecg_lengths = torch.tensor(lengths_ecg, dtype=torch.long)
+        ecg_available = ecg_valid_mask.any(dim=1)
     return PhysioSubBatch(
         physio_input=values.contiguous(),
         physio_valid_mask=valid_mask.contiguous(),
@@ -905,6 +1058,18 @@ def _collate_physiology(
         physio_quality_features=torch.stack(quality_features).clone().contiguous(),
         channel_names=channel_names,
         batch_indices=batch_indices.clone().contiguous(),
+        ecg_values=None if ecg_values is None else ecg_values.contiguous(),
+        ecg_valid_mask=(
+            None if ecg_valid_mask is None else ecg_valid_mask.contiguous()
+        ),
+        ecg_timestamps_seconds=(
+            None if ecg_timestamps is None else ecg_timestamps.contiguous()
+        ),
+        ecg_timeline_mask=(
+            None if ecg_timeline_mask is None else ecg_timeline_mask.contiguous()
+        ),
+        ecg_timeline_lengths=ecg_lengths,
+        ecg_available=ecg_available,
     )
 
 
@@ -998,6 +1163,14 @@ def collate_aligned_multimodal_samples(
         [sample.physiology_available for sample in sample_tuple],
         dtype=torch.bool,
     )
+    ecg_available = (
+        torch.tensor(
+            [sample.ecg_available for sample in sample_tuple],
+            dtype=torch.bool,
+        )
+        if any(sample.ecg_values is not None for sample in sample_tuple)
+        else None
+    )
     has_activity_diagnostics = any(
         sample.speech_activity_ratio is not None for sample in sample_tuple
     )
@@ -1060,4 +1233,5 @@ def collate_aligned_multimodal_samples(
         physiology=physiology,
         speech_activity_ratios=speech_activity_ratios,
         speech_activity_observed=speech_activity_observed,
+        ecg_available=ecg_available,
     )

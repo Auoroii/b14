@@ -105,6 +105,36 @@ def _filter_physiology(
             availability,
             as_tuple=False,
         ).flatten(),
+        ecg_values=(
+            None
+            if physiology.ecg_values is None
+            else _select_rows(physiology.ecg_values, row_indices)
+        ),
+        ecg_valid_mask=(
+            None
+            if physiology.ecg_valid_mask is None
+            else _select_rows(physiology.ecg_valid_mask, row_indices)
+        ),
+        ecg_timestamps_seconds=(
+            None
+            if physiology.ecg_timestamps_seconds is None
+            else _select_rows(physiology.ecg_timestamps_seconds, row_indices)
+        ),
+        ecg_timeline_mask=(
+            None
+            if physiology.ecg_timeline_mask is None
+            else _select_rows(physiology.ecg_timeline_mask, row_indices)
+        ),
+        ecg_timeline_lengths=(
+            None
+            if physiology.ecg_timeline_lengths is None
+            else _select_rows(physiology.ecg_timeline_lengths, row_indices)
+        ),
+        ecg_available=(
+            None
+            if physiology.ecg_available is None
+            else _select_rows(physiology.ecg_available, row_indices)
+        ),
     )
 
 
@@ -165,6 +195,11 @@ def apply_modality_keep_masks(
         ),
         speech_activity_ratios=batch.speech_activity_ratios,
         speech_activity_observed=batch.speech_activity_observed,
+        ecg_available=(
+            None
+            if batch.ecg_available is None
+            else batch.ecg_available & physiology_keep
+        ),
     )
 
 
@@ -293,6 +328,40 @@ def select_aligned_multimodal_batch(
             ),
             channel_names=batch.physiology.channel_names,
             batch_indices=old_to_new[retained_old_indices],
+            ecg_values=(
+                None
+                if batch.physiology.ecg_values is None
+                else _select_rows(batch.physiology.ecg_values, compact_rows)
+            ),
+            ecg_valid_mask=(
+                None
+                if batch.physiology.ecg_valid_mask is None
+                else _select_rows(batch.physiology.ecg_valid_mask, compact_rows)
+            ),
+            ecg_timestamps_seconds=(
+                None
+                if batch.physiology.ecg_timestamps_seconds is None
+                else _select_rows(
+                    batch.physiology.ecg_timestamps_seconds, compact_rows
+                )
+            ),
+            ecg_timeline_mask=(
+                None
+                if batch.physiology.ecg_timeline_mask is None
+                else _select_rows(batch.physiology.ecg_timeline_mask, compact_rows)
+            ),
+            ecg_timeline_lengths=(
+                None
+                if batch.physiology.ecg_timeline_lengths is None
+                else _select_rows(
+                    batch.physiology.ecg_timeline_lengths, compact_rows
+                )
+            ),
+            ecg_available=(
+                None
+                if batch.physiology.ecg_available is None
+                else _select_rows(batch.physiology.ecg_available, compact_rows)
+            ),
         )
 
     selected_records = tuple(batch.records[int(index)] for index in old_indices.tolist())
@@ -317,6 +386,11 @@ def select_aligned_multimodal_batch(
             None
             if batch.speech_activity_observed is None
             else _select_rows(batch.speech_activity_observed, old_indices)
+        ),
+        ecg_available=(
+            None
+            if batch.ecg_available is None
+            else _select_rows(batch.ecg_available, old_indices)
         ),
     )
 

@@ -6,6 +6,8 @@ from emotion_model.physiology.channel_metadata import (
     PhysioSignalKind,
 )
 from emotion_model.physiology.lightweight import (
+    ECG_ENCODER_TYPE,
+    LightweightEcgEncoder,
     LightweightPhysioClassifierOutput,
     LightweightPhysioEmotionClassifier,
     MultiScaleDilatedConv1dStem,
@@ -34,6 +36,8 @@ from emotion_model.physiology.quality import (
 __all__ = [
     "ChannelNormalizationStats",
     "ChannelwiseZScoreNormalizer",
+    "ECG_ENCODER_TYPE",
+    "LightweightEcgEncoder",
     "LightweightPhysioClassifierOutput",
     "LightweightPhysioEmotionClassifier",
     "MultiScaleDilatedConv1dStem",

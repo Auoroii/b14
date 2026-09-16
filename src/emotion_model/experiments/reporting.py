@@ -30,6 +30,7 @@ from emotion_model.evaluation import (
     EvaluationPredictions,
     ParticipantIndependentEvaluationOutput,
     SpeechActivityBin,
+    compute_emotion_task_metrics,
     compute_speech_activity_strata,
     speech_activity_bin_masks,
 )
@@ -295,7 +296,7 @@ def build_environment_summary(device: torch.device) -> dict[str, object]:
                     ],
                 }
             )
-    return {
+    result: dict[str, object] = {
         "python": sys.version,
         "python_executable": Path(sys.executable).name,
         "platform": platform.platform(),
@@ -308,6 +309,7 @@ def build_environment_summary(device: torch.device) -> dict[str, object]:
         "gpu_count": len(gpus),
         "gpus": gpus,
     }
+    return result
 
 
 _QUADRANT_NAMES = ("LALV", "HALV", "LAHV", "HAHV")
@@ -351,7 +353,7 @@ def _label_distribution(
             "ignored": int((~valid).sum().item()),
         }
 
-    return {
+    result: dict[str, object] = {
         "record_count": len(records),
         "arousal": binary_counts(arousal_labels, arousal_valid),
         "valence": binary_counts(valence_labels, valence_valid),
@@ -363,6 +365,7 @@ def _label_distribution(
             "ignored": int((~joint_valid).sum().item()),
         },
     }
+    return result
 
 
 def _declared_modality_pattern(record: MultimodalWindowRecord) -> str:
@@ -414,7 +417,7 @@ def _record_partition_summary(
         )
         for pattern in _DECLARED_MODALITY_PATTERNS
     }
-    return {
+    summary: dict[str, object] = {
         "record_count": len(records),
         "participant_count": len(participant_ids),
         "participant_ids": list(participant_ids),
@@ -444,6 +447,7 @@ def _record_partition_summary(
             for pattern in _DECLARED_MODALITY_PATTERNS
         },
     }
+    return summary
 
 
 def _availability_pattern(speech: bool, physiology: bool) -> str:
@@ -533,6 +537,7 @@ def build_runtime_availability_audit(
     mismatch_label_distribution = _empty_runtime_label_distribution()
     seen_sample_ids: set[str] = set()
     record_count = 0
+    ecg_enabled = False
 
     for sample in samples:
         if not isinstance(sample, AlignedMultimodalSample):
@@ -571,6 +576,9 @@ def build_runtime_availability_audit(
                 "declared_physiology_count": 0,
                 "runtime_physiology_available_count": 0,
                 "physiology_mismatch_count": 0,
+                "ecg_declared_count": 0,
+                "ecg_runtime_available_count": 0,
+                "ecg_mismatch_count": 0,
             },
         )
         participant["record_count"] = int(participant["record_count"]) + 1
@@ -601,6 +609,18 @@ def build_runtime_availability_audit(
         declared_channels = {
             source.channel_name for source in sample.record.physio_sources
         }
+        declared_ecg = "ecg" in declared_channels
+        runtime_ecg = sample.ecg_available
+        ecg_enabled = ecg_enabled or declared_ecg or sample.ecg_values is not None
+        participant["ecg_declared_count"] = int(
+            participant["ecg_declared_count"]
+        ) + int(declared_ecg)
+        participant["ecg_runtime_available_count"] = int(
+            participant["ecg_runtime_available_count"]
+        ) + int(runtime_ecg)
+        participant["ecg_mismatch_count"] = int(
+            participant["ecg_mismatch_count"]
+        ) + int(declared_ecg != runtime_ecg)
         for channel_name in declared_channels:
             declared_channel_counts[channel_name] = (
                 declared_channel_counts.get(channel_name, 0) + 1
@@ -614,9 +634,21 @@ def build_runtime_availability_audit(
                 runtime_channel_counts[channel_name] = (
                     runtime_channel_counts.get(channel_name, 0) + int(available)
                 )
+        if sample.ecg_values is not None:
+            runtime_channel_counts["ecg"] = (
+                runtime_channel_counts.get("ecg", 0) + int(runtime_ecg)
+            )
 
     channel_names = sorted(set(declared_channel_counts) | set(runtime_channel_counts))
-    return {
+    ecg_declared_count = declared_channel_counts.get("ecg", 0)
+    ecg_runtime_count = runtime_channel_counts.get("ecg", 0)
+    participants_with_ecg = sorted(
+        participant_id
+        for participant_id, counts in participant_counts.items()
+        if int(counts["ecg_runtime_available_count"]) > 0
+    )
+    participants_without_ecg = sorted(set(participant_counts) - set(participants_with_ecg))
+    audit: dict[str, object] = {
         "record_count": record_count,
         "modality_counts": modality_counts,
         "declared_to_runtime_pattern_counts": transition_counts,
@@ -639,6 +671,23 @@ def build_runtime_availability_audit(
             for channel_name in channel_names
         },
     }
+    if ecg_enabled:
+        audit["ecg"] = {
+            "declared_count": ecg_declared_count,
+            "runtime_available_count": ecg_runtime_count,
+            "mismatch_count": sum(
+                int(counts["ecg_mismatch_count"])
+                for counts in participant_counts.values()
+            ),
+            "available_window_count": ecg_runtime_count,
+            "missing_window_count": record_count - ecg_runtime_count,
+            "available_ratio": (
+                0.0 if record_count == 0 else ecg_runtime_count / record_count
+            ),
+            "participants_with_ecg": participants_with_ecg,
+            "participants_without_ecg": participants_without_ecg,
+        }
+    return audit
 
 
 def build_cross_fold_evaluation_summary(
@@ -720,7 +769,7 @@ def build_cross_fold_evaluation_summary(
             }
         )
 
-    return {
+    result: dict[str, object] = {
         "fold_count": len(fold_summaries),
         "fold_indices": fold_indices,
         "test_participant_count": len(test_participants),
@@ -736,6 +785,52 @@ def build_cross_fold_evaluation_summary(
         },
         "folds": fold_records,
     }
+    if all(isinstance(summary.get("ecg_subsets"), Mapping) for summary in fold_summaries):
+        subset_values: dict[str, list[float]] = {}
+        subset_fold_counts: dict[str, list[int]] = {"available": [], "missing": []}
+        for subset_name in ("available", "missing"):
+            for task in ("arousal", "valence"):
+                for metric in ("accuracy", "macro_f1", "balanced_accuracy"):
+                    subset_values[f"{subset_name}.{task}.{metric}"] = []
+                for label in ("low", "high"):
+                    for metric in ("recall", "f1"):
+                        subset_values[
+                            f"{subset_name}.{task}.per_class.{label}.{metric}"
+                        ] = []
+        for summary in fold_summaries:
+            subsets = cast(Mapping[str, object], summary["ecg_subsets"])
+            for subset_name in ("available", "missing"):
+                subset = cast(Mapping[str, object], subsets[subset_name])
+                count = subset.get("record_count")
+                if isinstance(count, bool) or not isinstance(count, int):
+                    raise TypeError("ECG subset record_count must be an integer.")
+                subset_fold_counts[subset_name].append(count)
+                metrics_root = cast(Mapping[str, object], subset["metrics"])
+                for path, numbers in subset_values.items():
+                    components = path.split(".")
+                    if components[0] != subset_name:
+                        continue
+                    current: object = metrics_root
+                    for component in components[1:]:
+                        if not isinstance(current, Mapping) or component not in current:
+                            raise ValueError(f"ECG subset is missing metric {path}.")
+                        current = current[component]
+                    if isinstance(current, bool) or not isinstance(current, (int, float)):
+                        raise TypeError(f"ECG subset metric {path} must be numeric.")
+                    numbers.append(float(current))
+        result["ecg_subset_metrics"] = {
+            "checkpoint_selection_eligible": False,
+            "record_count_fold_values": subset_fold_counts,
+            "metrics": {
+                path: {
+                    "mean": statistics.fmean(numbers),
+                    "std": statistics.pstdev(numbers),
+                    "fold_values": numbers,
+                }
+                for path, numbers in subset_values.items()
+            },
+        }
+    return result
 
 
 def build_split_summary(
@@ -767,7 +862,7 @@ def build_split_summary(
     if not isinstance(label_protocol, LabelProtocol):
         raise TypeError("label_protocol must be LabelProtocol.")
     split = partitioned.split
-    return {
+    summary: dict[str, object] = {
         "fold_index": fold_index,
         "split_seed": split_seed,
         "label_protocol": label_protocol.value,
@@ -789,6 +884,7 @@ def build_split_summary(
             ),
         },
     }
+    return summary
 
 
 def classification_metrics_summary(
@@ -882,7 +978,26 @@ def build_evaluation_summary(
         raise TypeError("fold_index must be an integer.")
     if not isinstance(checkpoint, Path) or checkpoint.is_absolute():
         raise ValueError("checkpoint must be a project-relative Path.")
-    return {
+    predictions = result.predictions
+
+    def ecg_subset(mask: torch.Tensor) -> dict[str, object]:
+        ignore = predictions.ignore_index
+        ignored = torch.full_like(predictions.arousal_targets, ignore)
+        metrics = compute_emotion_task_metrics(
+            arousal_targets=torch.where(mask, predictions.arousal_targets, ignored),
+            arousal_predictions=predictions.arousal_predictions,
+            valence_targets=torch.where(mask, predictions.valence_targets, ignored),
+            valence_predictions=predictions.valence_predictions,
+            quadrant_targets=torch.where(mask, predictions.quadrant_targets, ignored),
+            quadrant_predictions=predictions.quadrant_predictions,
+            ignore_index=ignore,
+        )
+        return {
+            "record_count": int(mask.sum().item()),
+            "metrics": emotion_metrics_summary(metrics),
+        }
+
+    summary: dict[str, object] = {
         "fold_index": fold_index,
         "checkpoint": checkpoint.as_posix(),
         "partition": result.partition.value,
@@ -925,6 +1040,13 @@ def build_evaluation_summary(
             for item in result.modality_stratum_metrics
         ],
     }
+    if predictions.ecg_enabled:
+        summary["ecg_subsets"] = {
+            "available": ecg_subset(predictions.ecg_available),
+            "missing": ecg_subset(~predictions.ecg_available),
+            "checkpoint_selection_eligible": False,
+        }
+    return summary
 
 
 def build_ablation_evaluation_summary(

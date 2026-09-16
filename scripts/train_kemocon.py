@@ -2329,6 +2329,10 @@ def _write_cross_fold_summary(
     output_directory = resolve_project_relative(_PROJECT_ROOT, config.paths.output_dir)
     evaluations: list[Mapping[str, object]] = []
     availability_audits: list[dict[str, object]] = []
+    ecg_available_windows = 0
+    ecg_missing_windows = 0
+    participants_with_ecg: set[str] = set()
+    participants_without_ecg: set[str] = set()
     assigned_test_participants: list[str] = []
     all_split_participants: set[str] = set()
     for fold_index in fold_indices:
@@ -2372,6 +2376,24 @@ def _write_cross_fold_summary(
                 ),
             }
         )
+        runtime_audit = split_summary.get("runtime_modality_availability_audit", {})
+        if isinstance(runtime_audit, dict):
+            test_audit = runtime_audit.get("test")
+            if isinstance(test_audit, dict):
+                ecg_audit = test_audit.get("ecg")
+                if isinstance(ecg_audit, dict):
+                    ecg_available_windows += int(
+                        ecg_audit.get("available_window_count", 0)
+                    )
+                    ecg_missing_windows += int(
+                        ecg_audit.get("missing_window_count", 0)
+                    )
+                    participants_with_ecg.update(
+                        cast(list[str], ecg_audit.get("participants_with_ecg", []))
+                    )
+                    participants_without_ecg.update(
+                        cast(list[str], ecg_audit.get("participants_without_ecg", []))
+                    )
     summary = build_cross_fold_evaluation_summary(evaluations)
     summary["split_strategy"] = config.split.strategy
     summary["split_seed"] = config.split.seed
@@ -2388,6 +2410,21 @@ def _write_cross_fold_summary(
     if not complete_coverage:
         raise ValueError("completed folds do not test every split participant once.")
     summary["runtime_modality_availability_audits"] = availability_audits
+    if "ecg" in config.dataset.channel_names:
+        ecg_window_count = ecg_available_windows + ecg_missing_windows
+        summary["ecg_coverage"] = {
+            "ecg_available_window_count": ecg_available_windows,
+            "ecg_missing_window_count": ecg_missing_windows,
+            "ecg_available_ratio": (
+                0.0
+                if ecg_window_count == 0
+                else ecg_available_windows / ecg_window_count
+            ),
+            "participants_with_ecg": sorted(participants_with_ecg),
+            "participants_without_ecg": sorted(
+                participants_without_ecg - participants_with_ecg
+            ),
+        }
     write_json_artifact(output_directory / "cross_fold_summary.json", summary)
 
 

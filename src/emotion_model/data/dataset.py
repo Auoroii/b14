@@ -114,6 +114,10 @@ class AlignedMultimodalSample:
     channel_names: tuple[str, ...]
     speech_activity_mask: Tensor | None = None
     speech_activity_ratio: float | None = None
+    ecg_values: Tensor | None = None
+    ecg_valid_mask: Tensor | None = None
+    ecg_timestamps_seconds: Tensor | None = None
+    ecg_available: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.record, MultimodalWindowRecord):
@@ -155,6 +159,7 @@ class AlignedMultimodalSample:
             raise ValueError("quadrant_label must be 0..3 or label_ignore_index.")
         _require_bool(self.speech_available, name="speech_available")
         _require_bool(self.physiology_available, name="physiology_available")
+        _require_bool(self.ecg_available, name="ecg_available")
         if not isinstance(self.channel_names, tuple) or not all(
             isinstance(name, str) for name in self.channel_names
         ):
@@ -162,6 +167,7 @@ class AlignedMultimodalSample:
         self._validate_speech_fields()
         self._validate_speech_activity_diagnostics()
         self._validate_physio_fields()
+        self._validate_ecg_fields()
 
     def _validate_speech_fields(self) -> None:
         fields = (
@@ -268,8 +274,10 @@ class AlignedMultimodalSample:
                 raise ValueError(
                     "empty channel_names requires all physiology fields to be None."
                 )
-            if self.physiology_available:
-                raise ValueError("physiology cannot be available without channel specs.")
+            if self.physiology_available and not self.ecg_available:
+                raise ValueError(
+                    "physiology cannot be available without a dense channel or ECG."
+                )
             return
         if not all(isinstance(value, Tensor) for value in fields):
             raise TypeError(
@@ -378,11 +386,56 @@ class AlignedMultimodalSample:
             and (self.physio_channel_quality <= 1.0).all()
         ):
             raise ValueError("physio quality values must be finite in [0, 1].")
-        expected_available = bool(self.physio_valid_mask.any())
+        expected_available = bool(self.physio_valid_mask.any()) or self.ecg_available
         if self.physiology_available != expected_available:
             raise ValueError(
-                "physiology_available must equal bool(physio_valid_mask.any())."
+                "physiology_available must equal dense-channel OR ECG availability."
             )
+
+    def _validate_ecg_fields(self) -> None:
+        """Validate optional low-frequency ECG-HR tensors with shape ``[Te]``."""
+        fields = (self.ecg_values, self.ecg_valid_mask, self.ecg_timestamps_seconds)
+        if all(value is None for value in fields):
+            if self.ecg_available:
+                raise ValueError("ecg_available requires ECG tensors.")
+            return
+        if not all(isinstance(value, Tensor) for value in fields):
+            raise TypeError("ECG values, mask, and timestamps must be provided together.")
+        assert isinstance(self.ecg_values, Tensor)
+        assert isinstance(self.ecg_valid_mask, Tensor)
+        assert isinstance(self.ecg_timestamps_seconds, Tensor)
+        if self.ecg_values.ndim != 1 or self.ecg_values.numel() <= 0:
+            raise ValueError("ecg_values must have non-empty shape [Te].")
+        if not self.ecg_values.is_floating_point():
+            raise TypeError("ecg_values must be floating point.")
+        if (
+            self.ecg_valid_mask.dtype != torch.bool
+            or tuple(self.ecg_valid_mask.shape) != tuple(self.ecg_values.shape)
+        ):
+            raise ValueError("ecg_valid_mask must be bool with shape [Te].")
+        if (
+            self.ecg_timestamps_seconds.dtype != torch.float64
+            or tuple(self.ecg_timestamps_seconds.shape) != tuple(self.ecg_values.shape)
+        ):
+            raise ValueError("ecg_timestamps_seconds must be float64 with shape [Te].")
+        for name, tensor in (
+            ("ecg_values", self.ecg_values),
+            ("ecg_valid_mask", self.ecg_valid_mask),
+            ("ecg_timestamps_seconds", self.ecg_timestamps_seconds),
+        ):
+            _require_cpu_tensor(tensor, name=name)
+        if not bool(torch.isfinite(self.ecg_values).all()):
+            raise ValueError("ecg_values must be finite.")
+        if bool(torch.count_nonzero(self.ecg_values[~self.ecg_valid_mask])):
+            raise ValueError("ecg_values must be zero at invalid positions.")
+        if not bool(torch.isfinite(self.ecg_timestamps_seconds).all()):
+            raise ValueError("ECG timestamps must be finite.")
+        if self.ecg_values.numel() > 1 and not bool(
+            (self.ecg_timestamps_seconds[1:] > self.ecg_timestamps_seconds[:-1]).all()
+        ):
+            raise ValueError("ECG timestamps must be strictly increasing.")
+        if self.ecg_available != bool(self.ecg_valid_mask.any()):
+            raise ValueError("ecg_available must equal bool(ecg_valid_mask.any()).")
 
 
 class AlignedMultimodalDataset(Dataset[AlignedMultimodalSample]):
@@ -430,6 +483,7 @@ class AlignedMultimodalDataset(Dataset[AlignedMultimodalSample]):
         physio_adapter: PhysioSourceAdapter | None = None,
         required_speech_sample_rate_hz: int = 16000,
         physio_target_sample_rate_hz: float | None = None,
+        ecg_sample_rate_hz: float = 1.0,
         output_dtype: torch.dtype = torch.float32,
         physio_filters: Mapping[str, PhysioFilter] | None = None,
         artifact_policy: PhysioArtifactPolicy | None = None,
@@ -458,10 +512,15 @@ class AlignedMultimodalDataset(Dataset[AlignedMultimodalSample]):
         spec_tuple = tuple(channel_specs)
         if not all(isinstance(spec, PhysioChannelSpec) for spec in spec_tuple):
             raise TypeError("channel_specs must contain PhysioChannelSpec objects.")
-        channel_names = tuple(spec.name for spec in spec_tuple)
-        if len(set(channel_names)) != len(channel_names):
+        all_channel_names = tuple(spec.name for spec in spec_tuple)
+        if len(set(all_channel_names)) != len(all_channel_names):
             raise ValueError("channel_specs names must be unique.")
-        known_channels = set(channel_names)
+        known_channels = set(all_channel_names)
+        ecg_specs = tuple(spec for spec in spec_tuple if spec.name == "ecg")
+        if len(ecg_specs) > 1:
+            raise ValueError("at most one ecg channel specification is allowed.")
+        dense_specs = tuple(spec for spec in spec_tuple if spec.name != "ecg")
+        channel_names = tuple(spec.name for spec in dense_specs)
         for record in record_tuple:
             for channel_source in record.physio_sources:
                 if channel_source.channel_name not in known_channels:
@@ -538,6 +597,7 @@ class AlignedMultimodalDataset(Dataset[AlignedMultimodalSample]):
 
         if spec_tuple and enable_physiology:
             target_rate = self._validate_target_rate(physio_target_sample_rate_hz)
+            ecg_rate = self._validate_ecg_rate(ecg_sample_rate_hz)
         elif spec_tuple:
             if any(
                 value is not None
@@ -554,6 +614,7 @@ class AlignedMultimodalDataset(Dataset[AlignedMultimodalSample]):
                     "physiology configuration must be None when physiology is disabled."
                 )
             target_rate = None
+            ecg_rate = None
         else:
             invalid_empty_spec_config = (
                 physio_target_sample_rate_hz is not None
@@ -568,6 +629,7 @@ class AlignedMultimodalDataset(Dataset[AlignedMultimodalSample]):
                     "physiology configuration must be None when channel_specs is empty."
                 )
             target_rate = None
+            ecg_rate = None
 
         filters: dict[str, PhysioFilter] = {}
         if physio_filters is not None:
@@ -588,12 +650,15 @@ class AlignedMultimodalDataset(Dataset[AlignedMultimodalSample]):
 
         self._records = record_tuple
         self._channel_specs = spec_tuple
+        self._dense_channel_specs = dense_specs
+        self._ecg_spec = ecg_specs[0] if ecg_specs else None
         self._channel_names = channel_names
         self._label_protocol = label_protocol
         self._speech_adapter = speech_adapter
         self._physio_adapter = physio_adapter
         self._required_speech_sample_rate_hz = required_speech_sample_rate_hz
         self._physio_target_sample_rate_hz = target_rate
+        self._ecg_sample_rate_hz = ecg_rate
         self._output_dtype = output_dtype
         self._physio_filters = filters
         self._artifact_policy = artifact_policy
@@ -620,6 +685,15 @@ class AlignedMultimodalDataset(Dataset[AlignedMultimodalSample]):
             raise ValueError(
                 "physio_target_sample_rate_hz must be finite and > 0."
             )
+        return result
+
+    @staticmethod
+    def _validate_ecg_rate(rate: object) -> float:
+        if isinstance(rate, bool) or not isinstance(rate, (int, float)):
+            raise TypeError("ecg_sample_rate_hz must be a real number, not bool.")
+        result = float(rate)
+        if not math.isfinite(result) or result <= 0.0:
+            raise ValueError("ecg_sample_rate_hz must be finite and > 0.")
         return result
 
     @property
@@ -686,6 +760,11 @@ class AlignedMultimodalDataset(Dataset[AlignedMultimodalSample]):
                 physio_channel_quality,
                 physio_quality_features,
             ) = self._load_physiology(record)
+            (
+                ecg_values,
+                ecg_valid_mask,
+                ecg_timestamps,
+            ) = self._load_ecg(record)
         else:
             physio_input = None
             physio_valid_mask = None
@@ -694,10 +773,15 @@ class AlignedMultimodalDataset(Dataset[AlignedMultimodalSample]):
             physio_timestamps = None
             physio_channel_quality = None
             physio_quality_features = None
+            ecg_values = None
+            ecg_valid_mask = None
+            ecg_timestamps = None
+        ecg_available = (
+            False if ecg_valid_mask is None else bool(ecg_valid_mask.any())
+        )
         physiology_available = (
-            False
-            if physio_valid_mask is None
-            else bool(physio_valid_mask.any())
+            (False if physio_valid_mask is None else bool(physio_valid_mask.any()))
+            or ecg_available
         )
         return AlignedMultimodalSample(
             record=record,
@@ -722,6 +806,10 @@ class AlignedMultimodalDataset(Dataset[AlignedMultimodalSample]):
             channel_names=(self._channel_names if self._enable_physiology else ()),
             speech_activity_mask=speech_activity_mask,
             speech_activity_ratio=speech_activity_ratio,
+            ecg_values=ecg_values,
+            ecg_valid_mask=ecg_valid_mask,
+            ecg_timestamps_seconds=ecg_timestamps,
+            ecg_available=ecg_available,
         )
 
     def _labels_for(
@@ -853,7 +941,7 @@ class AlignedMultimodalDataset(Dataset[AlignedMultimodalSample]):
         Tensor | None,
         Tensor | None,
     ]:
-        if not self._channel_specs:
+        if not self._dense_channel_specs:
             return None, None, None, None, None, None, None
         assert self._physio_target_sample_rate_hz is not None
         target_timestamps = self._build_target_timeline(
@@ -864,7 +952,7 @@ class AlignedMultimodalDataset(Dataset[AlignedMultimodalSample]):
         channel_values: list[Tensor] = []
         channel_masks: list[Tensor] = []
         quality_values: list[Tensor] = []
-        for spec in self._channel_specs:
+        for spec in self._dense_channel_specs:
             source = sources.get(spec.name)
             values, valid_mask, quality = self._process_channel(
                 record,
@@ -891,6 +979,80 @@ class AlignedMultimodalDataset(Dataset[AlignedMultimodalSample]):
             channel_quality,
             quality_features,
         )
+
+    def _load_ecg(
+        self,
+        record: MultimodalWindowRecord,
+    ) -> tuple[Tensor | None, Tensor | None, Tensor | None]:
+        """Load ECG-HR onto its own 1 Hz grid as three ``[Te]`` tensors.
+
+        Multiple real Polar measurements in the same target interval are
+        averaged. Empty intervals remain masked and no interpolation or
+        extrapolation is performed.
+        """
+        spec = self._ecg_spec
+        if spec is None:
+            return None, None, None
+        assert self._ecg_sample_rate_hz is not None
+        target_timestamps = self._build_target_timeline(
+            record,
+            rate=self._ecg_sample_rate_hz,
+        )
+        values = torch.zeros(target_timestamps.shape, dtype=self._output_dtype)
+        valid_mask = torch.zeros(target_timestamps.shape, dtype=torch.bool)
+        source = next(
+            (
+                item
+                for item in record.physio_sources
+                if item.channel_name == spec.name
+            ),
+            None,
+        )
+        if source is None:
+            return values, valid_mask, target_timestamps
+        assert self._physio_adapter is not None
+        try:
+            loaded = self._physio_adapter.load_physio(source, spec)
+            self._validate_loaded_physio(loaded, source=source, spec=spec)
+            usable_interval = source_overlap(record.window, source.source)
+            if usable_interval is None:
+                raise ValueError("declared ECG source has no window overlap.")
+            span = timestamp_index_span(loaded.timestamps_seconds, usable_interval)
+            source_values = loaded.values[span.start_index : span.end_index]
+            source_valid = loaded.valid_mask[span.start_index : span.end_index]
+            source_times = loaded.timestamps_seconds[span.start_index : span.end_index]
+            step = 1.0 / self._ecg_sample_rate_hz
+            for index, start in enumerate(target_timestamps):
+                in_bin = (
+                    (source_times >= start)
+                    & (source_times < min(float(start.item()) + step, record.window.end_seconds))
+                    & source_valid
+                )
+                if bool(in_bin.any()):
+                    values[index] = source_values[in_bin].to(self._output_dtype).mean()
+                    valid_mask[index] = True
+            window = PhysioChannelWindow(
+                spec=spec,
+                values=values,
+                valid_mask=valid_mask,
+                timestamps_seconds=target_timestamps,
+            )
+            normalized = self._normalize(record, window)
+            values = torch.where(
+                normalized.valid_mask,
+                normalized.values,
+                torch.zeros_like(normalized.values),
+            ).to(dtype=self._output_dtype)
+            valid_mask = normalized.valid_mask.clone()
+        except Exception as error:
+            raise self._source_error(
+                record=record,
+                modality="physiology",
+                source_id=source.source.source_id,
+                channel_name="ecg",
+                error=error,
+            ) from error
+        return values.contiguous(), valid_mask.contiguous(), target_timestamps
 
     @staticmethod
     def _build_target_timeline(

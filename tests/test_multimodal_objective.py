@@ -41,6 +41,7 @@ def _objective(
     ),
     weights: MultimodalLossWeights | None = None,
     gamma: float = 2.0,
+    speech_aux_min_activity_ratio: float | None = None,
 ) -> MultimodalTrainingObjective:
     """Create one parameter-free objective."""
     return MultimodalTrainingObjective(
@@ -48,6 +49,7 @@ def _objective(
             loss_kind=loss_kind,
             weights=weights or MultimodalLossWeights(),
             focal_gamma=gamma,
+            speech_aux_min_activity_ratio=speech_aux_min_activity_ratio,
         )
     )
 
@@ -162,6 +164,120 @@ def test_objective_config_rejects_invalid_kind_or_gamma(
             loss_kind=cast(ClassificationLossKind, loss_kind),
             focal_gamma=cast(float, gamma),
         )
+
+
+@pytest.mark.parametrize(
+    ("value", "error_type"),
+    [
+        (-0.1, ValueError),
+        (1.0, ValueError),
+        (float("nan"), ValueError),
+        (True, TypeError),
+        ("0.0", TypeError),
+    ],
+)
+def test_objective_config_rejects_invalid_speech_activity_threshold(
+    value: object,
+    error_type: type[Exception],
+) -> None:
+    """Require an optional finite speech auxiliary threshold in ``[0,1)``."""
+
+    with pytest.raises(error_type):
+        MultimodalObjectiveConfig(
+            speech_aux_min_activity_ratio=cast(float, value)
+        )
+
+
+def test_speech_auxiliary_uses_only_observed_rows_strictly_above_threshold() -> None:
+    """Match a manual loss over ratios ``0.1`` and ``0.8``, excluding zero."""
+
+    base = _batch(((True, True), (True, True), (True, True)))
+    batch = replace(
+        base,
+        arousal_labels=torch.tensor([0, 1, 0]),
+        valence_labels=torch.tensor([1, 0, 1]),
+        quadrant_labels=torch.tensor([2, 1, 2]),
+        speech_activity_ratios=torch.tensor([0.0, 0.1, 0.8]),
+        speech_activity_observed=torch.ones(3, dtype=torch.bool),
+    )
+    model = _model().eval()
+    output = model(batch)
+    weights = MultimodalLossWeights(fused=0.0, speech_auxiliary=1.0)
+    loss = _objective(
+        weights=weights,
+        speech_aux_min_activity_ratio=0.0,
+    )(output, batch)
+    compact = output.fusion_output.scheduled_outputs.speech_compact_output
+    assert compact is not None
+    manual = class_weighted_cross_entropy(
+        compact.arousal_logits[1:],
+        batch.arousal_labels[1:],
+        ignore_index=batch.label_ignore_index,
+    ) + class_weighted_cross_entropy(
+        compact.valence_logits[1:],
+        batch.valence_labels[1:],
+        ignore_index=batch.label_ignore_index,
+    )
+
+    torch.testing.assert_close(loss.speech_auxiliary_loss, manual)
+    assert loss.active_target_count == 4
+
+
+def test_all_silent_speech_auxiliary_is_graph_safe_zero_but_fused_is_active() -> None:
+    """Keep fused supervision while all compact speech targets are ignored."""
+
+    base = _batch(((True, True), (True, True), (True, True)))
+    batch = replace(
+        base,
+        speech_activity_ratios=torch.zeros(3),
+        speech_activity_observed=torch.ones(3, dtype=torch.bool),
+    )
+    model = _model().eval()
+    output = model(batch)
+    loss = _objective(
+        weights=MultimodalLossWeights(fused=1.0, speech_auxiliary=0.3),
+        speech_aux_min_activity_ratio=0.0,
+    )(output, batch)
+
+    assert torch.equal(
+        loss.speech_auxiliary_loss,
+        torch.zeros_like(loss.speech_auxiliary_loss),
+    )
+    assert bool(torch.isfinite(loss.speech_auxiliary_loss))
+    assert loss.speech_auxiliary_loss.grad_fn is not None
+    assert loss.fused_loss > 0.0
+    torch.testing.assert_close(loss.total_loss, loss.fused_loss)
+    assert loss.active_target_count == 6
+    loss.total_loss.backward()
+
+
+@pytest.mark.parametrize("with_ratios", [False, True])
+def test_enabled_speech_activity_filter_requires_observed_diagnostics(
+    with_ratios: bool,
+) -> None:
+    """Fail loudly for missing tensors or an unobserved compact speech row."""
+
+    batch = _batch(((True, True), (True, True), (True, True)))
+    if with_ratios:
+        batch = replace(
+            batch,
+            speech_activity_ratios=torch.tensor([0.0, 0.1, 0.8]),
+            speech_activity_observed=torch.tensor([True, False, True]),
+        )
+    model = _model().eval()
+    objective = _objective(
+        weights=MultimodalLossWeights(fused=0.0, speech_auxiliary=1.0),
+        speech_aux_min_activity_ratio=0.0,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "speech auxiliary activity filtering requires observed speech "
+            "activity diagnostics"
+        ),
+    ):
+        objective(model(batch), batch)
 
 
 def test_configuration_dataclasses_are_frozen() -> None:

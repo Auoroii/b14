@@ -15,6 +15,7 @@ from emotion_model.physiology.channel_metadata import PhysioChannelSpec
 _RELIABILITY_SCORE_TYPE = "availability_indicator"
 _STATE_VERSION = 2
 PHYSIOLOGY_ENCODER_MODES = frozenset({"single_scale", "multiscale_dilated"})
+ECG_ENCODER_TYPE = "mask_aware_statistics_mlp"
 
 
 def _positive_integer(value: int, *, name: str) -> int:
@@ -162,6 +163,123 @@ class MultiScaleDilatedConv1dStem(nn.Module):
         return torch.where(valid_mask, fused, torch.zeros_like(fused))
 
 
+class LightweightEcgEncoder(nn.Module):
+    """Encode low-frequency Polar HR values using five masked statistics.
+
+    Forward consumes normalized ``ecg_values`` and boolean ``ecg_mask`` with
+    shape ``[B, Te]`` plus an optional boolean timeline mask of the same shape.
+    It returns ``(embedding, statistics, available)`` with shapes ``[B, De]``,
+    ``[B, 5]``, and ``[B]``. The statistic order is mean, population standard
+    deviation, last-minus-first delta, normalized-time least-squares slope,
+    and valid ratio. Completely missing rows return exact zeros.
+    """
+
+    def __init__(self, embedding_dim: int = 16, *, dropout: float = 0.3) -> None:
+        super().__init__()
+        self.embedding_dim = _positive_integer(embedding_dim, name="embedding_dim")
+        self.dropout = _dropout(dropout, name="dropout")
+        self.network = nn.Sequential(
+            nn.LayerNorm(5),
+            nn.Linear(5, 16),
+            nn.GELU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(16, self.embedding_dim),
+        )
+
+    def forward(
+        self,
+        ecg_values: Tensor,
+        ecg_mask: Tensor,
+        *,
+        timeline_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Return ECG embedding ``[B,De]``, statistics ``[B,5]``, validity ``[B]``."""
+        if not isinstance(ecg_values, Tensor) or ecg_values.ndim != 2:
+            raise ValueError("ecg_values must have shape [B, Te].")
+        if not ecg_values.is_floating_point():
+            raise TypeError("ecg_values must be floating point.")
+        if (
+            not isinstance(ecg_mask, Tensor)
+            or ecg_mask.dtype != torch.bool
+            or tuple(ecg_mask.shape) != tuple(ecg_values.shape)
+            or ecg_mask.device != ecg_values.device
+        ):
+            raise ValueError("ecg_mask must be bool [B, Te] on the input device.")
+        if ecg_values.shape[0] <= 0 or ecg_values.shape[1] <= 0:
+            raise ValueError("ecg_values dimensions must be non-empty.")
+        if timeline_mask is None:
+            timeline = torch.ones_like(ecg_mask)
+        else:
+            if (
+                not isinstance(timeline_mask, Tensor)
+                or timeline_mask.dtype != torch.bool
+                or tuple(timeline_mask.shape) != tuple(ecg_values.shape)
+                or timeline_mask.device != ecg_values.device
+            ):
+                raise ValueError("timeline_mask must be bool [B, Te].")
+            timeline = timeline_mask
+        if bool((ecg_mask & ~timeline).any()):
+            raise ValueError("ecg_mask must be a subset of timeline_mask.")
+        if not bool(torch.isfinite(ecg_values[ecg_mask]).all()):
+            raise ValueError("valid ECG values must be finite.")
+        safe = torch.where(ecg_mask, ecg_values, torch.zeros_like(ecg_values))
+        counts = ecg_mask.sum(dim=1)
+        available = counts > 0
+        denominator = counts.clamp_min(1).to(dtype=ecg_values.dtype)
+        mean = safe.sum(dim=1) / denominator
+        centered = torch.where(
+            ecg_mask,
+            safe - mean.unsqueeze(1),
+            torch.zeros_like(safe),
+        )
+        std = torch.sqrt((centered.square().sum(dim=1) / denominator).clamp_min(0.0))
+        indices = torch.arange(ecg_values.shape[1], device=ecg_values.device)
+        first_indices = torch.where(
+            ecg_mask,
+            indices.unsqueeze(0),
+            ecg_values.shape[1],
+        ).min(dim=1).values.clamp_max(ecg_values.shape[1] - 1)
+        last_indices = (
+            torch.where(ecg_mask, indices.unsqueeze(0), -1)
+            .max(dim=1)
+            .values.clamp_min(0)
+        )
+        first = safe.gather(1, first_indices.unsqueeze(1)).squeeze(1)
+        last = safe.gather(1, last_indices.unsqueeze(1)).squeeze(1)
+        at_least_two = counts >= 2
+        delta = torch.where(at_least_two, last - first, torch.zeros_like(mean))
+        timeline_lengths = timeline.sum(dim=1).clamp_min(1)
+        time = indices.to(dtype=ecg_values.dtype).unsqueeze(0) / (
+            (timeline_lengths - 1).clamp_min(1).to(dtype=ecg_values.dtype).unsqueeze(1)
+        )
+        time_mean = (time * ecg_mask.to(dtype=ecg_values.dtype)).sum(dim=1) / denominator
+        time_centered = torch.where(
+            ecg_mask,
+            time - time_mean.unsqueeze(1),
+            torch.zeros_like(time),
+        )
+        slope_denominator = time_centered.square().sum(dim=1)
+        slope = torch.where(
+            at_least_two & (slope_denominator > 0),
+            (time_centered * centered).sum(dim=1) / slope_denominator.clamp_min(1.0e-12),
+            torch.zeros_like(mean),
+        )
+        valid_ratio = counts.to(dtype=ecg_values.dtype) / timeline_lengths.to(
+            dtype=ecg_values.dtype
+        )
+        statistics = torch.stack((mean, std, delta, slope, valid_ratio), dim=1)
+        statistics = torch.where(
+            available.unsqueeze(1), statistics, torch.zeros_like(statistics)
+        )
+        embedding = self.network(statistics)
+        embedding = torch.where(
+            available.unsqueeze(1), embedding, torch.zeros_like(embedding)
+        )
+        if not bool(torch.isfinite(statistics).all() and torch.isfinite(embedding).all()):
+            raise RuntimeError("ECG encoder output contains NaN or Inf.")
+        return embedding, statistics, available
+
+
 @dataclass(frozen=True)
 class LightweightPhysioClassifierOutput:
     """Outputs of the lightweight physiology classifier.
@@ -187,6 +305,9 @@ class LightweightPhysioClassifierOutput:
     reliability: Tensor
     reliability_score_type: str
     quadrant_logits: Tensor | None = None
+    ecg_embedding: Tensor | None = None
+    ecg_statistics: Tensor | None = None
+    ecg_available: Tensor | None = None
 
 
 class LightweightPhysioEmotionClassifier(nn.Module):
@@ -218,6 +339,9 @@ class LightweightPhysioEmotionClassifier(nn.Module):
         stem_dropout: float = 0.1,
         physiology_encoder: str = "single_scale",
         physiology_dilations: Sequence[int] = (1, 2, 4),
+        ecg_embedding_dim: int = 16,
+        ecg_encoder_type: str = ECG_ENCODER_TYPE,
+        ecg_sample_rate_hz: float = 1.0,
     ) -> None:
         super().__init__()
         specs = tuple(channel_specs)
@@ -230,8 +354,30 @@ class LightweightPhysioEmotionClassifier(nn.Module):
             raise ValueError("stem_channels must contain exactly two widths.")
         first_dim = _positive_integer(widths[0], name="stem_channels[0]")
         second_dim = _positive_integer(widths[1], name="stem_channels[1]")
+        ecg_specs = tuple(spec for spec in specs if spec.name == "ecg")
+        if len(ecg_specs) > 1:
+            raise ValueError("at most one ecg channel specification is allowed.")
+        dense_specs = tuple(spec for spec in specs if spec.name != "ecg")
+        if not dense_specs:
+            raise ValueError("at least one dense physiology channel is required.")
         self.channel_specs = specs
-        self.channel_names = tuple(spec.name for spec in specs)
+        self.dense_channel_specs = dense_specs
+        self.channel_names = tuple(spec.name for spec in dense_specs)
+        self.ecg_enabled = bool(ecg_specs)
+        self.ecg_embedding_dim = _positive_integer(
+            ecg_embedding_dim, name="ecg_embedding_dim"
+        )
+        if ecg_encoder_type != ECG_ENCODER_TYPE:
+            raise ValueError(f"ecg_encoder_type must be {ECG_ENCODER_TYPE!r}.")
+        self.ecg_encoder_type = ecg_encoder_type
+        if (
+            isinstance(ecg_sample_rate_hz, bool)
+            or not isinstance(ecg_sample_rate_hz, (int, float))
+            or not math.isfinite(float(ecg_sample_rate_hz))
+            or float(ecg_sample_rate_hz) <= 0.0
+        ):
+            raise ValueError("ecg_sample_rate_hz must be finite and positive.")
+        self.ecg_sample_rate_hz = float(ecg_sample_rate_hz)
         self.stem_channels = (first_dim, second_dim)
         self.physiology_embedding_dim = _positive_integer(
             physiology_embedding_dim,
@@ -261,7 +407,7 @@ class LightweightPhysioEmotionClassifier(nn.Module):
         if self.physiology_encoder == "single_scale":
             self.channel_stems = nn.ModuleList(
                 _IndependentChannelStem(first_dim, second_dim, self.stem_dropout)
-                for _ in specs
+                for _ in dense_specs
             )
         else:
             self.channel_stems = nn.ModuleList(
@@ -271,9 +417,16 @@ class LightweightPhysioEmotionClassifier(nn.Module):
                     self.physiology_dilations,
                     dropout=self.stem_dropout,
                 )
-                for _ in specs
+                for _ in dense_specs
             )
-        statistics_dim = len(specs) * (2 * second_dim) + len(specs)
+        self.ecg_encoder = (
+            LightweightEcgEncoder(self.ecg_embedding_dim, dropout=self.dropout)
+            if self.ecg_enabled
+            else None
+        )
+        statistics_dim = len(dense_specs) * (2 * second_dim) + len(dense_specs)
+        if self.ecg_enabled:
+            statistics_dim += self.ecg_embedding_dim + 1
         self.statistics_dim = statistics_dim
         self.embedding_projection = nn.Sequential(
             nn.LayerNorm(statistics_dim),
@@ -286,7 +439,7 @@ class LightweightPhysioEmotionClassifier(nn.Module):
 
     def get_extra_state(self) -> dict[str, object]:
         """Return all ordered semantics and architecture checkpoint fields."""
-        return {
+        state: dict[str, object] = {
             "state_version": _STATE_VERSION,
             "variant": "lightweight_shared_dynamic_relation_differential_full_window",
             "channel_specs": tuple(
@@ -307,6 +460,16 @@ class LightweightPhysioEmotionClassifier(nn.Module):
             "physiology_dilations": self.physiology_dilations,
             "reliability_score_type": _RELIABILITY_SCORE_TYPE,
         }
+        if self.ecg_enabled:
+            state.update(
+                {
+                    "ecg_enabled": True,
+                    "ecg_embedding_dim": self.ecg_embedding_dim,
+                    "ecg_encoder_type": self.ecg_encoder_type,
+                    "ecg_sample_rate_hz": self.ecg_sample_rate_hz,
+                }
+            )
+        return state
 
     def set_extra_state(self, state: object) -> None:
         """Reject a checkpoint whose architecture or channel order differs."""
@@ -337,7 +500,11 @@ class LightweightPhysioEmotionClassifier(nn.Module):
                 "physio_valid_mask must be bool [B, T, C] on the input device."
             )
         batch_size, time_steps, channel_count = physio_input.shape
-        if batch_size <= 0 or time_steps <= 0 or channel_count != len(self.channel_specs):
+        if (
+            batch_size <= 0
+            or time_steps <= 0
+            or channel_count != len(self.dense_channel_specs)
+        ):
             raise ValueError("physio_input dimensions must be non-empty and match specs.")
         if isinstance(channel_names, (str, bytes)) or tuple(channel_names) != self.channel_names:
             raise ValueError("channel_names must exactly match configured spec order.")
@@ -396,6 +563,9 @@ class LightweightPhysioEmotionClassifier(nn.Module):
         physio_channel_mask: Tensor | None = None,
         physio_quality_features: Tensor | None = None,
         physio_quality_prior: Tensor | None = None,
+        ecg_values: Tensor | None = None,
+        ecg_valid_mask: Tensor | None = None,
+        ecg_timeline_mask: Tensor | None = None,
     ) -> LightweightPhysioClassifierOutput:
         """Encode physiology ``[B,T,C]`` with ``True=valid`` masks.
 
@@ -433,14 +603,32 @@ class LightweightPhysioEmotionClassifier(nn.Module):
         stacked_features = torch.stack(channel_features, dim=2)
         stacked_statistics = torch.stack(channel_statistics, dim=1)
         available_tensor = torch.stack(channel_available, dim=1)
-        sample_valid = available_tensor.any(dim=1)
-        concatenated = torch.cat(
-            (
-                stacked_statistics.flatten(start_dim=1),
-                available_tensor.to(dtype=physio_input.dtype),
-            ),
-            dim=1,
+        dense_valid = available_tensor.any(dim=1)
+        concatenated_parts = [
+            stacked_statistics.flatten(start_dim=1),
+            available_tensor.to(dtype=physio_input.dtype),
+        ]
+        ecg_embedding: Tensor | None = None
+        ecg_statistics: Tensor | None = None
+        ecg_available: Tensor | None = None
+        if self.ecg_enabled:
+            if ecg_values is None or ecg_valid_mask is None:
+                raise ValueError("enabled ECG branch requires values and valid mask.")
+            assert self.ecg_encoder is not None
+            ecg_embedding, ecg_statistics, ecg_available = self.ecg_encoder(
+                ecg_values,
+                ecg_valid_mask,
+                timeline_mask=ecg_timeline_mask,
+            )
+            concatenated_parts.extend(
+                (ecg_embedding, ecg_available.to(physio_input.dtype).unsqueeze(1))
+            )
+        elif any(value is not None for value in (ecg_values, ecg_valid_mask, ecg_timeline_mask)):
+            raise ValueError("ECG tensors were provided to an ECG-disabled classifier.")
+        sample_valid = dense_valid | (
+            torch.zeros_like(dense_valid) if ecg_available is None else ecg_available
         )
+        concatenated = torch.cat(concatenated_parts, dim=1)
         valid_rows = sample_valid.unsqueeze(1)
         physio_embedding = torch.where(
             valid_rows,
@@ -518,6 +706,9 @@ class LightweightPhysioEmotionClassifier(nn.Module):
             sample_valid=sample_valid,
             reliability=reliability,
             reliability_score_type=_RELIABILITY_SCORE_TYPE,
+            ecg_embedding=ecg_embedding,
+            ecg_statistics=ecg_statistics,
+            ecg_available=ecg_available,
         )
 
 
@@ -526,4 +717,6 @@ __all__ = [
     "PHYSIOLOGY_ENCODER_MODES",
     "LightweightPhysioClassifierOutput",
     "LightweightPhysioEmotionClassifier",
+    "LightweightEcgEncoder",
+    "ECG_ENCODER_TYPE",
 ]

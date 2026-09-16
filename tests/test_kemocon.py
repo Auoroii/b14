@@ -165,6 +165,47 @@ def test_speech_pooling_config_accepts_attentive_ablation(
     assert config.model.speech_attention_hidden_dim == 17
 
 
+def test_formal_config_enables_nonsilent_speech_auxiliary_supervision() -> None:
+    """Parse the strict-zero activity threshold from the formal experiment."""
+
+    config = load_kemocon_experiment_config(
+        "configs/kemocon_v4_2_full_window_relation_differential.yaml"
+    )
+
+    assert config.loss.speech_aux_min_activity_ratio == 0.0
+    assert config.paths.output_dir.as_posix() == (
+        "runs/kemocon_v4_2_speechaux_nonsilent_cv_seed2026"
+    )
+
+
+@pytest.mark.parametrize(
+    ("replacement", "error_type"),
+    [
+        ("speech_aux_min_activity_ratio: -0.1", ValueError),
+        ("speech_aux_min_activity_ratio: 1.0", ValueError),
+        ("speech_aux_min_activity_ratio: true", TypeError),
+    ],
+)
+def test_speech_aux_activity_threshold_rejects_invalid_values(
+    workspace_tmp_path: Path,
+    replacement: str,
+    error_type: type[Exception],
+) -> None:
+    """Reject negative, one-or-greater, and boolean threshold values."""
+
+    source = Path(
+        "configs/kemocon_v4_2_full_window_relation_differential.yaml"
+    ).read_text(encoding="utf-8")
+    path = workspace_tmp_path / "invalid-speech-aux-threshold.yaml"
+    path.write_text(
+        source.replace("speech_aux_min_activity_ratio: 0.0", replacement),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(error_type, match="speech_aux_min_activity_ratio"):
+        load_kemocon_experiment_config(path)
+
+
 @pytest.mark.parametrize(
     ("replacement", "message"),
     [

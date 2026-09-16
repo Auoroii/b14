@@ -45,6 +45,7 @@ _OBJECTIVE_FIELDS = frozenset(
         "speech_quadrant",
         "physiology_quadrant",
         "focal_gamma",
+        "speech_aux_min_activity_ratio",
     }
 )
 _TRAINING_STATE_FIELDS = frozenset(
@@ -220,7 +221,7 @@ def _copy_metadata(
 
 def _objective_config(
     objective: MultimodalTrainingObjective,
-) -> dict[str, str | float]:
+) -> dict[str, str | float | None]:
     config = objective.config
     weights = config.weights
     return {
@@ -232,6 +233,9 @@ def _objective_config(
         "speech_quadrant": weights.speech_quadrant,
         "physiology_quadrant": weights.physiology_quadrant,
         "focal_gamma": config.focal_gamma,
+        "speech_aux_min_activity_ratio": (
+            config.speech_aux_min_activity_ratio
+        ),
     }
 
 

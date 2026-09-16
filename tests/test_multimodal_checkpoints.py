@@ -53,12 +53,14 @@ def _objective(
     ),
     weights: MultimodalLossWeights | None = None,
     focal_gamma: float = 2.0,
+    speech_aux_min_activity_ratio: float | None = None,
 ) -> MultimodalTrainingObjective:
     return MultimodalTrainingObjective(
         MultimodalObjectiveConfig(
             loss_kind=loss_kind,
             weights=weights or MultimodalLossWeights(),
             focal_gamma=focal_gamma,
+            speech_aux_min_activity_ratio=speech_aux_min_activity_ratio,
         )
     )
 
@@ -203,6 +205,7 @@ def test_checkpoint_payload_has_exact_basic_schema_and_no_path(
     assert type(payload["model_state"]) is dict
     assert type(payload["optimizer_state"]) is dict
     assert type(payload["objective_config"]) is dict
+    assert payload["objective_config"]["speech_aux_min_activity_ratio"] is None
     assert type(payload["training_state"]) is dict
     assert payload["extra_metadata"] == {}
     assert str(path) not in repr(payload)
@@ -868,6 +871,33 @@ def test_load_rejects_objective_semantics_before_state_copy(
         )
     assert target_objective.config.loss_kind is ClassificationLossKind.FOCAL
     _assert_nested_equal(target_model.state_dict(), target_before)
+
+
+def test_load_rejects_speech_auxiliary_activity_threshold_mismatch(
+    tmp_path: Path,
+) -> None:
+    """Fingerprint the activity-filtered speech supervision semantics."""
+
+    source_model = _model()
+    path = tmp_path / "speech-activity-objective.pt"
+    save_multimodal_checkpoint(
+        path,
+        model=source_model,
+        optimizer=_optimizer(source_model),
+        objective=_objective(speech_aux_min_activity_ratio=0.0),
+        training_state=MultimodalTrainingState(),
+    )
+    payload = _load_payload(path)
+    assert payload["objective_config"]["speech_aux_min_activity_ratio"] == 0.0
+
+    target_model = _model()
+    with pytest.raises(MultimodalCheckpointError, match="objective_config"):
+        load_multimodal_checkpoint(
+            path,
+            model=target_model,
+            optimizer=_optimizer(target_model),
+            objective=_objective(speech_aux_min_activity_ratio=None),
+        )
 
 
 def test_valid_restore_calls_each_loader_once_then_restores_rng(

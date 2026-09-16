@@ -12,6 +12,27 @@
 
 ## 2. 数据窗口与 manifest
 
+### H1: S1+ + ECG
+
+H1 is the single-variable extension of S1+: S1+ uses BVP/EDA/TEMP and H1
+uses BVP/EDA/TEMP/ECG. The semantic name is always `ecg`. `ecg` corresponds
+to the Polar H7 heart-rate signal stored in `Polar_HR.csv`; it is a low-rate
+heart-rate sequence and is not treated as a raw high-sample-rate ECG waveform.
+
+Each existing half-open five-second sample window is reused unchanged. ECG is
+binned on a separate 1 Hz grid; duplicate measurements at the same timestamp
+and multiple measurements in one grid interval are averaged. Empty positions
+are zero with `mask=False`, with no extrapolation. ECG absence never removes a
+sample and overall physiology remains available when any BVP/EDA/TEMP/ECG
+channel has a valid value.
+
+ECG z-score statistics are fitted from the current fold's training records
+only and stored in the existing normalizer/checkpoint metadata. The ECG branch
+uses masked mean/std/delta/normalized-time slope/valid-ratio statistics and a
+5→16→`ecg_embedding_dim` MLP. Its output is multiplied by ECG availability;
+the final physiology embedding remains 64-dimensional and no ECG task head is
+added.
+
 每条 manifest record 表示同一参与者、同一会话中的半开 5 秒时间窗。语音目标采样率为 16 kHz，因此完整窗口为 80000 个采样点。生理信号包含配置中声明的 BVP、EDA、TEMP 通道，并按显式单位、原始采样率和目标时间轴处理。
 
 split 以 debate dyad/session 为隔离单位，训练、验证、测试参与者不得交叉。默认配置使用 5-fold label-stratified rotating splits 和确定性 seed；每个参与者恰好作为测试参与者一次。生理归一化统计只能从当前 fold 的训练分区拟合。每个 fold 必须审计 manifest 声明可用性与实际加载后的模态/通道可用性，完整实验必须汇总 fold 均值与标准差。
@@ -27,7 +48,7 @@ split 以 debate dyad/session 为隔离单位，训练、验证、测试参与�
 
 静音不是模态缺失。全零、近静音、0.2 秒发声、短时发声和持续发声都必须保留完整窗口并执行 speech branch。
 
-`speech_activity_mask` 和 `speech_activity_ratio` 仅用于报告。它们不得控制 availability、compact selection、WavLM、emotion pooling、relation differential、声学条件池化、FiLM、fusion、classifier、sample validity 或 loss。
+`speech_activity_mask` 和 `speech_activity_ratio` 不得控制 availability、compact selection、WavLM、emotion pooling、relation differential、声学条件池化、FiLM、fusion、classifier、sample validity 或最终 fused supervision。唯一允许的训练用途是在 objective 层过滤 speech auxiliary supervision：配置阈值启用时，只有 `speech_activity_observed=True` 且 `speech_activity_ratio > speech_aux_min_activity_ratio` 的 compact speech row 保留辅助标签；缺少 activity observation 必须明确报错。ratio 为零的窗口仍执行完整 speech branch 并参与 multimodal fusion。
 
 ## 4. Mask 语义
 
@@ -92,7 +113,7 @@ normalization. No cross-channel or quality-aware computation is introduced.
 
 `MultimodalEmotionClassifier` 的 arousal 和 valence head 均从同一个 shared classifier trunk 和 `fused_embedding` 预测，不存在 task-specific fusion weights。quadrant 概率由两项二分类概率推导。
 
-目标函数使用 class-weighted cross entropy；当前单变量采样实验将 speech auxiliary loss 保持为 0.3，physiology auxiliary loss 保持为 0.1。只对 label 与 sample validity 都有效的条目计入损失。人工 modality dropout 属于训练时缺失模拟，但不得产生双模态同时被丢弃的样本。
+目标函数使用 class-weighted cross entropy；speech auxiliary loss 权重为 0.3，physiology auxiliary loss 为 0.1。当前 `speech_aux_min_activity_ratio=0.0`，speech auxiliary 的 arousal/valence/quadrant 标签仅在 activity 已观测且 ratio 严格大于零时有效。该过滤不改变 fused loss、physiology auxiliary loss 或样本有效性。人工 modality dropout 属于训练时缺失模拟，但不得产生双模态同时被丢弃的样本。
 
 测试必须启用 same-window modality ablation：只在自然状态下 speech 与 physiology 都可用的测试窗口上分别执行 speech-only 和 physiology-only 推理。该诊断不得参与训练、阈值拟合或 checkpoint 选择。
 

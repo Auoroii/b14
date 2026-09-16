@@ -946,33 +946,58 @@ class MultimodalBatchScheduler(nn.Module):
                 self.physiology_classifier,
                 name="physiology_classifier",
             )
-            raw_physiology_output = self.physiology_classifier(
-                physio_input=_runtime_tensor(
+            physiology_arguments = {
+                "physio_input": _runtime_tensor(
                     physiology_compact.physio_input,
                     physiology_reference,
                     floating=True,
                 ),
-                physio_valid_mask=_runtime_tensor(
+                "physio_valid_mask": _runtime_tensor(
                     physiology_compact.physio_valid_mask,
                     physiology_reference,
                     floating=False,
                 ),
-                channel_names=physiology_compact.channel_names,
-                physio_time_mask=_runtime_tensor(
+                "channel_names": physiology_compact.channel_names,
+                "physio_time_mask": _runtime_tensor(
                     physiology_compact.physio_time_mask,
                     physiology_reference,
                     floating=False,
                 ),
-                physio_channel_mask=_runtime_tensor(
+                "physio_channel_mask": _runtime_tensor(
                     physiology_compact.physio_channel_mask,
                     physiology_reference,
                     floating=False,
                 ),
-                physio_quality_features=_runtime_tensor(
+                "physio_quality_features": _runtime_tensor(
                     physiology_compact.physio_quality_features,
                     physiology_reference,
                     floating=True,
                 ),
+            }
+            if physiology_compact.ecg_values is not None:
+                assert physiology_compact.ecg_valid_mask is not None
+                assert physiology_compact.ecg_timeline_mask is not None
+                physiology_arguments.update(
+                    {
+                        "ecg_values": _runtime_tensor(
+                            physiology_compact.ecg_values,
+                            physiology_reference,
+                            floating=True,
+                        ),
+                        "ecg_valid_mask": _runtime_tensor(
+                            physiology_compact.ecg_valid_mask,
+                            physiology_reference,
+                            floating=False,
+                        ),
+                        "ecg_timeline_mask": _runtime_tensor(
+                            physiology_compact.ecg_timeline_mask,
+                            physiology_reference,
+                            floating=False,
+                        ),
+                    }
+                )
+            raw_physiology_output = self.physiology_classifier(
+                **physiology_arguments  # type: ignore[arg-type]
             )
             if not isinstance(
                 raw_physiology_output,

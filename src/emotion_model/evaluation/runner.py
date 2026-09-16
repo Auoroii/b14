@@ -194,6 +194,10 @@ class EvaluationPredictions:
         default_factory=lambda: torch.empty(0, dtype=torch.float32)
     )
     modality_weights: Tensor | None = None
+    ecg_available: Tensor = field(
+        default_factory=lambda: torch.empty(0, dtype=torch.bool)
+    )
+    ecg_enabled: bool = False
 
     def __post_init__(self) -> None:
         _validate_ids(self.sample_ids, name="sample_ids", unique=True)
@@ -210,6 +214,8 @@ class EvaluationPredictions:
             raise TypeError("ignore_index must be an integer, not bool.")
         if 0 <= self.ignore_index < 4:
             raise ValueError("ignore_index must lie outside [0, 4).")
+        if not isinstance(self.ecg_enabled, bool):
+            raise TypeError("ecg_enabled must be bool.")
 
         bool_names = (
             "speech_available",
@@ -242,6 +248,7 @@ class EvaluationPredictions:
             object.__setattr__(self, name, value.detach().clone())
 
         diagnostic_specs = (
+            ("ecg_available", torch.bool),
             ("speech_source_present", torch.bool),
             ("speech_activity_observed", torch.bool),
             ("speech_activity_ratios", torch.float32),
@@ -965,6 +972,8 @@ def evaluate_participant_independent(
     participant_ids: list[str] = []
     speech_available: list[Tensor] = []
     physiology_available: list[Tensor] = []
+    ecg_available: list[Tensor] = []
+    ecg_enabled = False
     speech_source_present: list[Tensor] = []
     speech_activity_observed: list[Tensor] = []
     aligned_speech_activity_ratios: list[Tensor] = []
@@ -1169,6 +1178,17 @@ def evaluate_participant_independent(
         physiology_available.append(
             batch.physiology_available.detach().clone().cpu()
         )
+        ecg_available.append(
+            (
+                torch.zeros_like(batch.physiology_available)
+                if batch.ecg_available is None
+                else batch.ecg_available
+            )
+            .detach()
+            .clone()
+            .cpu()
+        )
+        ecg_enabled = ecg_enabled or batch.ecg_available is not None
         batch_activity_observed = torch.zeros_like(source_present)
         batch_activity_ratios = torch.zeros(
             len(batch.records),
@@ -1268,6 +1288,8 @@ def evaluate_participant_independent(
         speech_activity_observed=torch.cat(speech_activity_observed),
         speech_activity_ratios=torch.cat(aligned_speech_activity_ratios),
         modality_weights=torch.cat(modality_weights_rows),
+        ecg_available=torch.cat(ecg_available),
+        ecg_enabled=ecg_enabled,
     )
     working_targets = _working_targets(evaluation_predictions)
     all_rows = torch.ones(len(sample_ids), dtype=torch.bool)

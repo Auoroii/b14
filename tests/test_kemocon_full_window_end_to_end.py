@@ -371,7 +371,8 @@ def test_five_windows_and_true_missing_control_flow_end_to_end(
     config = load_kemocon_experiment_config(_CONFIG_PATH)
     loss_output = build_kemocon_objective(config.loss)(output, batch)
     assert bool(torch.isfinite(loss_output.total_loss))
-    assert loss_output.active_target_count == 34
+    assert loss_output.active_target_count == 32
+    assert loss_output.speech_auxiliary_loss > 0.0
     arousal_gradient, valence_gradient = torch.autograd.grad(
         loss_output.fused_loss,
         (output.arousal_logits, output.valence_logits),

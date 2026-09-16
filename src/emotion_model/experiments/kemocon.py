@@ -77,6 +77,7 @@ class KEmoConDatasetConfig:
     speech_sample_rate_hz: int
     physio_target_sample_rate_hz: float
     label_protocol: LabelProtocol
+    ecg_sample_rate_hz: float = 1.0
     speech_activity: SpeechActivityDetectorConfig = SpeechActivityDetectorConfig()
 
 
@@ -124,6 +125,8 @@ class KEmoConModelConfig:
     differential_lambda_init: float = 0.5
     differential_residual_scale: float = 0.1
     condition_gate_on_noise: bool = True
+    ecg_embedding_dim: int = 16
+    ecg_encoder_type: str = "mask_aware_statistics_mlp"
     variant: str = _MODEL_VARIANT
 
 
@@ -137,6 +140,7 @@ class KEmoConLossConfig:
     speech_aux_weight: float
     physiology_aux_weight: float
     class_weight_power: float = 1.0
+    speech_aux_min_activity_ratio: float | None = None
 
 
 class KEmoConModalityMode(StrEnum):
@@ -197,6 +201,7 @@ _SECTION_FIELDS: dict[str, frozenset[str]] = {
             "window_seconds",
             "speech_sample_rate_hz",
             "physio_target_sample_rate_hz",
+            "ecg_sample_rate_hz",
             "label_protocol",
             "speech_activity",
         }
@@ -220,6 +225,7 @@ _SECTION_FIELDS: dict[str, frozenset[str]] = {
             "speech_aux_weight",
             "physiology_aux_weight",
             "class_weight_power",
+            "speech_aux_min_activity_ratio",
         }
     ),
     "training": frozenset(
@@ -276,6 +282,8 @@ _MODEL_FIELDS = frozenset(
         "differential_lambda_init",
         "differential_residual_scale",
         "condition_gate_on_noise",
+        "ecg_embedding_dim",
+        "ecg_encoder_type",
     }
 )
 
@@ -447,6 +455,16 @@ def _parse_model_config(
             "differential_residual_scale",
         ),
         condition_gate_on_noise=_boolean(model, "condition_gate_on_noise"),
+        ecg_embedding_dim=(
+            _integer(model, "ecg_embedding_dim")
+            if "ecg_embedding_dim" in model
+            else 16
+        ),
+        ecg_encoder_type=(
+            _string(model, "ecg_encoder_type")
+            if "ecg_encoder_type" in model
+            else "mask_aware_statistics_mlp"
+        ),
         variant=raw_variant,
     )
 
@@ -642,6 +660,11 @@ def load_kemocon_experiment_config(path: str | Path) -> KEmoConExperimentConfig:
                 dataset,
                 "physio_target_sample_rate_hz",
             ),
+            ecg_sample_rate_hz=(
+                _real(dataset, "ecg_sample_rate_hz")
+                if "ecg_sample_rate_hz" in dataset
+                else 1.0
+            ),
             label_protocol=LabelProtocol(_string(dataset, "label_protocol")),
             speech_activity=SpeechActivityDetectorConfig(
                 enabled=(
@@ -701,6 +724,11 @@ def load_kemocon_experiment_config(path: str | Path) -> KEmoConExperimentConfig:
                 _real(loss, "class_weight_power")
                 if "class_weight_power" in loss
                 else 1.0
+            ),
+            speech_aux_min_activity_ratio=(
+                _real(loss, "speech_aux_min_activity_ratio")
+                if "speech_aux_min_activity_ratio" in loss
+                else None
             ),
         ),
         training=KEmoConTrainingConfig(
@@ -807,6 +835,7 @@ def _validate_config(config: KEmoConExperimentConfig) -> None:
         "model.speech_attention_hidden_dim": (
             config.model.speech_attention_hidden_dim
         ),
+        "model.ecg_embedding_dim": config.model.ecg_embedding_dim,
         "training.batch_size": config.training.batch_size,
         "training.epochs": config.training.epochs,
         "training.early_stopping_patience": (
@@ -924,6 +953,18 @@ def _validate_config(config: KEmoConExperimentConfig) -> None:
             "model.physiology_encoder must be 'single_scale' or "
             "'multiscale_dilated'."
         )
+    if config.model.ecg_encoder_type != "mask_aware_statistics_mlp":
+        raise ValueError(
+            "model.ecg_encoder_type must be 'mask_aware_statistics_mlp'."
+        )
+    allowed_channels = {
+        ("bvp", "eda", "temperature"),
+        ("bvp", "eda", "temperature", "ecg"),
+    }
+    if config.dataset.channel_names not in allowed_channels:
+        raise ValueError(
+            "dataset.channels must be S1+ BVP/EDA/TEMP or H1 with trailing ECG."
+        )
     if any(value <= 0 for value in config.model.physiology_dilations):
         raise ValueError("model.physiology_dilations values must be positive.")
     if len(set(config.model.physiology_dilations)) != 3:
@@ -950,6 +991,7 @@ def _validate_config(config: KEmoConExperimentConfig) -> None:
             "dataset.physio_target_sample_rate_hz",
             config.dataset.physio_target_sample_rate_hz,
         ),
+        ("dataset.ecg_sample_rate_hz", config.dataset.ecg_sample_rate_hz),
         ("training.learning_rate", config.training.learning_rate),
         ("training.wavlm_learning_rate", config.training.wavlm_learning_rate),
         ("training.max_gradient_norm", config.training.max_gradient_norm),
@@ -960,6 +1002,13 @@ def _validate_config(config: KEmoConExperimentConfig) -> None:
         raise ValueError("training.weight_decay must be non-negative.")
     if not 0.0 <= config.loss.class_weight_power <= 1.0:
         raise ValueError("loss.class_weight_power must lie in [0, 1].")
+    if (
+        config.loss.speech_aux_min_activity_ratio is not None
+        and not 0.0 <= config.loss.speech_aux_min_activity_ratio < 1.0
+    ):
+        raise ValueError(
+            "loss.speech_aux_min_activity_ratio must lie in [0, 1)."
+        )
     if config.training.checkpoint_selection_metric not in {
         "validation_loss",
         "mean_macro_f1",
@@ -1129,6 +1178,7 @@ def build_kemocon_dataset(
         physio_adapter=KEmoConPhysioAdapter(data_root),
         required_speech_sample_rate_hz=config.speech_sample_rate_hz,
         physio_target_sample_rate_hz=config.physio_target_sample_rate_hz,
+        ecg_sample_rate_hz=config.ecg_sample_rate_hz,
         physio_normalizer=normalizer,
         enable_speech=True,
         enable_physiology=True,
@@ -1342,6 +1392,8 @@ def build_kemocon_class_weights(
 def _build_kemocon_physiology_classifier(
     model_config: KEmoConModelConfig,
     specs: tuple[PhysioChannelSpec, ...],
+    *,
+    ecg_sample_rate_hz: float,
 ) -> tuple[LightweightPhysioEmotionClassifier, int]:
     """Build a physiology classifier consuming ``[B,T,C]`` and return its width."""
 
@@ -1354,6 +1406,9 @@ def _build_kemocon_physiology_classifier(
             stem_dropout=0.1,
             physiology_encoder=model_config.physiology_encoder,
             physiology_dilations=model_config.physiology_dilations,
+            ecg_embedding_dim=model_config.ecg_embedding_dim,
+            ecg_encoder_type=model_config.ecg_encoder_type,
+            ecg_sample_rate_hz=ecg_sample_rate_hz,
         ),
         model_config.physiology_embedding_dim,
     )
@@ -1436,6 +1491,7 @@ def build_kemocon_model(
     physiology_classifier, physiology_dim = _build_kemocon_physiology_classifier(
         model_config,
         specs,
+        ecg_sample_rate_hz=config.dataset.ecg_sample_rate_hz,
     )
     scheduler = MultimodalBatchScheduler(speech_classifier, physiology_classifier)
     fusion = FullWindowDynamicMultimodalFusion(
@@ -1603,6 +1659,9 @@ def build_kemocon_objective(
                 physiology_auxiliary=config.physiology_aux_weight,
             ),
             focal_gamma=config.focal_gamma,
+            speech_aux_min_activity_ratio=(
+                config.speech_aux_min_activity_ratio
+            ),
         )
     )
 

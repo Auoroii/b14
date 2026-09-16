@@ -11,8 +11,9 @@
 The formal configuration now represents S1 and keeps mask-aware attentive
 speech pooling. B0 is recovered with `speech_pooling: mean_std`. In both modes
 the only temporal validity input is the WavLM-derived feature attention mask.
-`speech_activity_mask` and `speech_activity_ratio` remain diagnostics and
-never enter pooling scores.
+`speech_activity_mask` and `speech_activity_ratio` never enter pooling scores,
+WavLM masks, routing, or fusion. The only configured training use is to omit
+unobserved or zero-activity rows from speech auxiliary supervision.
 
 ```yaml
 model:
@@ -22,9 +23,10 @@ model:
   physiology_dilations: [1, 2, 4]
 ```
 
-P1 is isolated in
-`configs/kemocon_v4_2_p1_multiscale_dilated_physio.yaml`. It differs from S1
-only by the output directory and `physiology_encoder: multiscale_dilated`.
+The completed P1 ablation remains isolated in
+`configs/kemocon_v4_2_p1_multiscale_dilated_physio.yaml`. The current formal
+configuration has since added activity-filtered speech auxiliary supervision;
+the historical P1 configuration remains unchanged with the old objective.
 Each BVP/EDA/TEMP channel remains independent and uses dilation branches
 1/2/4 followed by concatenation and a 1x1 convolution. Physiology pooling
 remains masked mean/std; no branch attention or quality modulation is used.
@@ -33,7 +35,7 @@ remains masked mean/std; no branch attention or quality modulation is used.
 
 每条记录使用参与者自己的 5 秒、16 kHz 音频窗口，以及同一时间窗内的 BVP、EDA、TEMP 生理信号。
 
-语音可用性采用 `source_presence`：音频源存在并成功读取即为可用。完整静音、极短发声和短时发声都是有效语音窗口；`speech_activity_mask` 与 `speech_activity_ratio` 只用于诊断统计，不参与可用性、路由、WavLM mask、池化、FiLM、融合或损失。
+语音可用性采用 `source_presence`：音频源存在并成功读取即为可用。完整静音、极短发声和短时发声都是有效语音窗口；`speech_activity_mask` 与 `speech_activity_ratio` 不参与可用性、路由、WavLM mask、池化、FiLM、融合或 fused loss。唯一允许的训练用途是在 objective 层过滤 speech auxiliary supervision：当前阈值为 `0.0`，仅 `observed_activity=True` 且 `speech_activity_ratio > 0.0` 的 speech compact row 提供辅助标签。
 
 语音路径：完整 waveform → WavLM → 固定均值聚合的 H9–H12 情感表征 → H1–H2 声学/噪声条件 → relation differential → bounded FiLM → speech embedding。当前稳定配置完全冻结 WavLM；顶部解冻和可学习层聚合在 fold 0 未产生可靠的整体收益，因此不保留在生产实验配置中。
 
@@ -50,6 +52,27 @@ python scripts/cache_wavlm.py --help
 ```
 
 ## 数据准备、校验、训练与评估
+
+### H1：S1+ + ECG
+
+The H1 configuration is
+`configs/kemocon_v4_2_h1_ecg.yaml`. It differs from S1+ only by adding the
+optional `ecg` channel and its tiny statistics MLP. `ecg` corresponds to the
+Polar H7 heart-rate signal stored in `Polar_HR.csv`; it is kept on a separate
+1 Hz grid and is never upsampled into the 64 Hz BVP/EDA/TEMP Conv1D path.
+Missing ECG windows and participants remain in the experiment.
+
+```bash
+python scripts/prepare_kemocon.py --config configs/kemocon_v4_2_h1_ecg.yaml
+python scripts/validate_kemocon.py --config configs/kemocon_v4_2_h1_ecg.yaml
+python scripts/train_kemocon.py --config configs/kemocon_v4_2_h1_ecg.yaml --all-folds
+python scripts/evaluate_kemocon.py --config configs/kemocon_v4_2_h1_ecg.yaml
+```
+
+H1 writes to `runs/kemocon_v4_2_h1_ecg_cv_seed2026/`, leaving S1+ outputs
+untouched. Fold reports include ECG declaration/runtime mismatch counts,
+window and participant coverage, and ECG-available/missing subset metrics.
+Subset metrics are diagnostic only and are excluded from checkpoint selection.
 
 所有路径均由配置文件给出，并相对于仓库根目录解析：
 
@@ -73,7 +96,7 @@ python -m pytest -q
 
 默认 manifest：`artifacts/kemocon/manifest_self.json`
 
-默认 S1 实验目录：`runs/kemocon_v4_2_attentive_stats_s1_cv_seed2026/`
+当前正式实验目录：`runs/kemocon_v4_2_speechaux_nonsilent_cv_seed2026/`
 
 每个 fold 写入 `fold_<index>/`，主要文件包括：
 

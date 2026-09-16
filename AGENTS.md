@@ -28,7 +28,7 @@
 - source 存在且成功读取即 `speech_available=True`，包括全零和任意短时发声。
 - source 不存在才自然 unavailable；读取失败必须抛出 `SourceAdapterError`。
 - 显式 modality dropout 可以人工将 speech 标记为 unavailable。
-- speech activity mask/ratio 只用于诊断，不得影响模型计算、路由、融合或损失。
+- speech activity mask/ratio 不得影响 availability、WavLM、模型计算、路由、融合或最终 fused supervision。唯一允许的训练用途是：当 loss 配置显式启用阈值时，以 `observed_activity & (speech_activity_ratio > threshold)` 过滤 speech auxiliary supervision；静音窗口仍是有效 multimodal sample。
 
 ## Mask 约定
 
